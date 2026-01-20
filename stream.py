@@ -1,11 +1,11 @@
 import argparse
-import os
-import subprocess
 import sys
 
 import yaml
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType
 from pyspark.sql import SparkSession, functions as F
+
+from checks import check_java_version, check_kafka_broker, check_kafka_topic
 
 
 def news_item_schema() -> StructType:
@@ -72,8 +72,13 @@ def start_news_stream(
         .select("news.*")
     )
 
+    prepped_df = parsed_df.withColumn(
+        "text_prepped",
+        F.regexp_replace(F.trim(F.col("text")), r"\s+", " ")
+    )
+
     query = (
-        parsed_df.writeStream.format("console")
+        prepped_df.writeStream.format("console")
         .option("truncate", False)
         .option("checkpointLocation", checkpoint_location)
         .outputMode("append")
@@ -82,67 +87,6 @@ def start_news_stream(
 
     query.awaitTermination()
 
-
-def check_java_version() -> None:
-    """Check if Java 17 is installed and set as JAVA_HOME.
-    
-    Raises:
-        SystemExit: If Java is not found or wrong version is detected.
-    """
-    java_home = os.environ.get("JAVA_HOME")
-    
-    if not java_home:
-        print("ERROR: JAVA_HOME is not set.")
-        print("\nPySpark 4.1.1 requires Java 17.")
-        print("\nOn macOS, set JAVA_HOME with:")
-        print("  export JAVA_HOME=$(/usr/libexec/java_home -v 17)")
-        print("\nOr install Java 17:")
-        print("  brew install --cask temurin17")
-        sys.exit(1)
-    
-    try:
-        # Check Java version
-        result = subprocess.run(
-            ["java", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        version_output = result.stderr  # java -version outputs to stderr
-        
-        # Parse version number (e.g., "17.0.1" from output)
-        if "version" in version_output:
-            # Extract version string, handling formats like "17.0.1", "1.8.0_xxx", etc.
-            for line in version_output.split('\n'):
-                if 'version' in line:
-                    # Look for quoted version string
-                    import re
-                    match = re.search(r'"(\d+)', line)
-                    if match:
-                        major_version = int(match.group(1))
-                        
-                        if major_version != 17:
-                            print(f"ERROR: Java {major_version} detected, but Java 17 is required.")
-                            print(f"\nCurrent JAVA_HOME: {java_home}")
-                            print("\nPySpark 4.1.1 is compatible with Java 17.")
-                            print("\nOn macOS, set JAVA_HOME to Java 17:")
-                            print("  export JAVA_HOME=$(/usr/libexec/java_home -v 17)")
-                            sys.exit(1)
-                        
-                        print(f"✓ Java 17 detected (JAVA_HOME: {java_home})")
-                        return
-        
-        print("WARNING: Could not determine Java version.")
-        print(f"JAVA_HOME is set to: {java_home}")
-        
-    except FileNotFoundError:
-        print("ERROR: Java executable not found.")
-        print(f"JAVA_HOME is set to: {java_home}")
-        print("\nPlease install Java 17 and ensure it's in your PATH.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"WARNING: Could not verify Java version: {e}")
-        print(f"JAVA_HOME is set to: {java_home}")
 
 
 def load_config(config_path: str) -> dict:
@@ -207,6 +151,17 @@ if __name__ == "__main__":
     starting_offsets = args.starting_offsets or config.get("kafka", {}).get(
         "starting_offsets", "latest"
     )
+
+    # Check Kafka broker connectivity before starting stream
+    print("\n--- Kafka Connectivity Check ---")
+    if not check_kafka_broker(bootstrap_servers):
+        print(f"\nERROR: Cannot reach any Kafka broker at {bootstrap_servers}")
+        print("Please ensure Kafka is running and accessible.")
+        sys.exit(1)
+    
+    # Check if topic exists
+    check_kafka_topic(bootstrap_servers, "raw_news")
+    print("")
 
     start_news_stream(
         bootstrap_servers=bootstrap_servers,

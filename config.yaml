@@ -1,0 +1,10 @@
+# Kafka Streaming Configuration
+
+kafka:
+  bootstrap_servers: "localhost:9092"
+  topic: "raw_news"
+  starting_offsets: "latest"  # Options: "earliest" or "latest"
+
+spark:
+  checkpoint_location: "/tmp/raw_news_checkpoints"
+  app_name: "raw-news-stream"

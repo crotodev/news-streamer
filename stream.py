@@ -12,7 +12,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from checks import check_java_version
+from checks import check_java_version, ensure_kafka_topic
 from sentiment_client import call_sentiment_api_partition
 
 
@@ -207,6 +207,9 @@ def start_news_stream(
         .config("spark.sql.streaming.schemaInference", False)
         .getOrCreate()
     )
+
+    if bootstrap_servers:
+        ensure_kafka_topic(bootstrap_servers, "enriched_news")
 
     # Read raw Kafka messages; values are expected to be JSON-serialized `NewsItem`.
     kafka_df = (

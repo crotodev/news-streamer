@@ -83,6 +83,59 @@ def check_kafka_topic(bootstrap_servers: str, topic: str = "raw_news") -> bool:
         return True  # Don't fail on other errors
 
 
+def ensure_kafka_topic(
+    bootstrap_servers: str,
+    topic: str,
+    num_partitions: int = 1,
+    replication_factor: int = 1,
+    request_timeout_ms: int = 5000,
+) -> bool:
+    """Ensure a Kafka topic exists; create if missing.
+
+    Returns True if topic exists or was created, False if create failed.
+    """
+    try:
+        check_kafka_topic(bootstrap_servers, topic)
+        from kafka import KafkaAdminClient
+        from kafka.admin import NewTopic
+        from kafka.errors import TopicAlreadyExistsError
+
+        print(
+            f"Creating topic '{topic}' with partitions={num_partitions}, replication={replication_factor}...",
+            end="",
+            flush=True,
+        )
+        admin = KafkaAdminClient(
+            bootstrap_servers=[s.strip() for s in bootstrap_servers.split(",")],
+            request_timeout_ms=request_timeout_ms,
+        )
+        try:
+            admin.create_topics(
+                [
+                    NewTopic(
+                        name=topic,
+                        num_partitions=num_partitions,
+                        replication_factor=replication_factor,
+                    )
+                ],
+                validate_only=False,
+            )
+            print(" ✓ Created")
+            return True
+        except TopicAlreadyExistsError:
+            print(" ✓ Already exists")
+            return True
+        finally:
+            admin.close()
+    except ImportError:
+        print(" ? Skipped (kafka-python not installed)")
+        print("Install with: pip install kafka-python")
+        return True
+    except Exception as e:
+        print(f" ✗ Failed to create topic '{topic}': {e}")
+        return False
+
+
 def check_java_version() -> None:
     """Check if Java 17 is installed and set as JAVA_HOME.
     

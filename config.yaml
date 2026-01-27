@@ -4,6 +4,7 @@ kafka:
   bootstrap_servers: "localhost:9092"
   topic: "raw_news"
   starting_offsets: "latest"  # Options: "earliest" or "latest"
+  write_enriched: true
 
 spark:
   checkpoint_location: "/tmp/raw_news_checkpoints"

@@ -1,6 +1,6 @@
 # News Streamer
 
-A PySpark Structured Streaming application that consumes news articles from a Kafka topic, parses JSON payloads, and displays them in real-time.
+A PySpark Structured Streaming application that consumes news articles from Kafka, enriches them with sentiment, and optionally writes enriched results back to Kafka and/or Parquet.
 
 ## Features
 
@@ -8,6 +8,8 @@ A PySpark Structured Streaming application that consumes news articles from a Ka
 - **Flexible configuration** via YAML file or command-line arguments
 - **Automatic schema parsing** for news articles with comprehensive metadata
 - **Console output** for monitoring incoming articles
+- **Kafka output** to `enriched_news` (auto-creates topic)
+- **Parquet output** partitioned by ingest date
 - **Checkpointing** for fault-tolerant streaming
 
 ## Prerequisites
@@ -16,6 +18,7 @@ A PySpark Structured Streaming application that consumes news articles from a Ka
 - **Java 17** (required for PySpark 4.1.1)
 - **Apache Kafka** running locally or remotely
 - **Kafka topic** named `raw_news` with JSON-formatted news articles
+- **Kafka topic** named `enriched_news` (auto-created at startup if missing)
 
 ## Installation
 
@@ -34,7 +37,7 @@ source .venv/bin/activate  # On macOS/Linux
 
 3. Install dependencies:
 ```bash
-pip install pyspark pyyaml
+pip install pyspark pyyaml kafka-python
 ```
 
 4. Install Java 17 (macOS with Homebrew):
@@ -54,6 +57,7 @@ kafka:
   bootstrap_servers: "localhost:9092"
   topic: "raw_news"
   starting_offsets: "latest"  # Options: "earliest" or "latest"
+  write_enriched: true
 
 spark:
   checkpoint_location: "/tmp/raw_news_checkpoints"
@@ -105,6 +109,12 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) python stream.py \
 
 ```bash
 JAVA_HOME=$(/usr/libexec/java_home -v 17) python stream.py --starting-offsets earliest
+
+### Enable Kafka Output
+
+```bash
+JAVA_HOME=$(/usr/libexec/java_home -v 17) python stream.py --write-kafka
+```
 ```
 
 ## News Article Schema
@@ -148,6 +158,10 @@ All fields are nullable.
 ```
 usage: stream.py [-h] [--config CONFIG] [--bootstrap-servers BOOTSTRAP_SERVERS]
                  [--checkpoint-location CHECKPOINT_LOCATION]
+                 [--parquet-output-dir PARQUET_OUTPUT_DIR]
+                 [--parquet-checkpoint-dir PARQUET_CHECKPOINT_DIR]
+                 [--write-parquet | --no-write-parquet]
+                 [--write-kafka | --no-write-kafka]
                  [--starting-offsets {earliest,latest}]
 
 Stream news from Kafka to console
@@ -159,6 +173,14 @@ optional arguments:
                         Kafka bootstrap servers (overrides config file)
   --checkpoint-location CHECKPOINT_LOCATION
                         Spark checkpoint location (overrides config file)
+  --parquet-output-dir PARQUET_OUTPUT_DIR
+                        Parquet output directory (overrides config file)
+  --parquet-checkpoint-dir PARQUET_CHECKPOINT_DIR
+                        Parquet checkpoint directory (overrides config file)
+  --write-parquet         Enable Parquet sink (default: true; overrides config file)
+  --no-write-parquet      Disable Parquet sink (overrides config file)
+  --write-kafka           Enable Kafka sink to enriched_news topic (default: false; overrides config file)
+  --no-write-kafka        Disable Kafka sink (overrides config file)
   --starting-offsets {earliest,latest}
                         Kafka starting offsets: earliest or latest (overrides config file)
 ```
@@ -181,7 +203,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 
 **Solution**: 
 - Verify Kafka is running: `kafka-topics --bootstrap-server localhost:9092 --list`
-- Check the topic exists: Ensure `raw_news` topic is created
+- Check the topic exists: Ensure `raw_news` topic is created; `enriched_news` is auto-created at startup
 - Verify bootstrap servers in config match your Kafka setup
 
 ### Missing Dependencies
@@ -191,6 +213,13 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 **Solution**: Install PyYAML:
 ```bash
 pip install pyyaml
+```
+
+**Problem**: `No module named 'kafka'`
+
+**Solution**: Install kafka-python:
+```bash
+pip install kafka-python
 ```
 
 ### Checkpoint Issues
@@ -209,17 +238,23 @@ rm -rf /tmp/raw_news_checkpoints
 │    Kafka    │─────▶│   PySpark    │─────▶│   Console   │
 │  raw_news   │      │  Streaming   │      │   Output    │
 └─────────────┘      └──────────────┘      └─────────────┘
-                            │
-                            ▼
-                     ┌──────────────┐
-                     │ Checkpoints  │
-                     └──────────────┘
+        │
+        ├──────────────▶ Kafka: enriched_news
+        │
+        ├──────────────▶ Parquet: data/parquet/news_enriched
+        │
+        ▼
+      ┌──────────────┐
+      │ Checkpoints  │
+      └──────────────┘
 ```
 
 1. **Kafka Source**: Reads JSON messages from `raw_news` topic
 2. **PySpark Processing**: Parses JSON using defined schema
 3. **Console Sink**: Displays formatted articles in terminal
-4. **Checkpointing**: Maintains streaming state for fault tolerance
+4. **Kafka Sink**: Writes enriched JSON to `enriched_news` topic (optional)
+5. **Parquet Sink**: Writes enriched rows partitioned by `ingest_date` (optional)
+6. **Checkpointing**: Maintains streaming state for fault tolerance
 
 ## Development
 
@@ -255,6 +290,7 @@ news-streamer/
 - `check_java_version()` - Validates Java 17 installation
 - `check_kafka_broker()` - Tests Kafka connectivity
 - `check_kafka_topic()` - Verifies topic existence
+- `ensure_kafka_topic()` - Creates topic if missing
 
 ### Configuration & Environment
 

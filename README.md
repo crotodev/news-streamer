@@ -227,15 +227,48 @@ rm -rf /tmp/raw_news_checkpoints
 
 ```
 news-streamer/
-├── stream.py           # Main streaming application
-├── config.yaml         # Default configuration
-├── README.md          # This file
-└── .venv/             # Virtual environment (created during setup)
+├── stream.py              # Main streaming application
+├── sentiment_client.py    # Sentiment API HTTP client
+├── checks.py             # Health checks and environment validation
+├── config.yaml           # Default configuration
+├── README.md            # This file
+├── requirements.txt     # Python dependencies
+└── .venv/               # Virtual environment (created during setup)
+```
+
+### Code Organization
+
+**stream.py** - Main streaming pipeline with modular functions:
+- `build_text_for_sentiment()` - Text preparation for sentiment analysis (fallback: summary > title > body, truncate to 2000 chars)
+- `prepare_base_dataframe()` - DataFrame preparation and filtering
+- `call_sentiment_api()` - Sentiment API integration via mapPartitions
+- `display_enriched_results()` - Console output formatting
+- `enrich_sentiment_foreach_batch()` - Orchestrates the enrichment pipeline
+- `start_news_stream()` - Sets up the Structured Streaming query
+
+**sentiment_client.py** - REST API client for sentiment inference:
+- Batches HTTP requests to sentiment service
+- Handles empty text filtering
+- Returns structured sentiment results (label, score, error)
+
+**checks.py** - Environment validation:
+- `check_java_version()` - Validates Java 17 installation
+- `check_kafka_broker()` - Tests Kafka connectivity
+- `check_kafka_topic()` - Verifies topic existence
+
+### Configuration & Environment
+
+**Environment Variables** (all optional, tunable):
+```bash
+SENTIMENT_ENDPOINT=http://localhost:9000/api/sentiment/batch   # Sentiment service URL
+SENTIMENT_BATCH_SIZE=25                                          # Items per API batch
+SENTIMENT_TIMEOUT_S=30                                           # HTTP request timeout
+MAX_SENTIMENT_CHARS=2000                                         # Text truncation limit
 ```
 
 ### Extending the Application
 
-To add new output formats or processing logic, modify the `start_news_stream()` function in `stream.py`. The current implementation uses a console sink, but you can replace it with:
+To add new output formats or processing logic, modify the `start_news_stream()` function in `stream.py`. The current implementation uses a console sink and sentiment enrichment, but you can:
 
 - **CSV output**: See commented code sections for CSV sink examples
 - **Parquet files**: Change `.format("console")` to `.format("parquet")`

@@ -5,8 +5,15 @@ import sys
 
 import yaml
 from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType
+from pyspark.sql.types import (
+    DoubleType,
+    StructField,
+    StructType,
+    StringType,
+    TimestampType,
+)
 
+from checks import check_java_version
 from sentiment_client import call_sentiment_api_partition
 
 
@@ -20,11 +27,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Sentiment API Configuration
 SENTIMENT_ENDPOINT = os.environ.get(
     "SENTIMENT_ENDPOINT", "http://localhost:9000/api/sentiment/batch"
 )
 SENTIMENT_BATCH_SIZE = _env_int("SENTIMENT_BATCH_SIZE", 25)
 SENTIMENT_TIMEOUT_S = _env_int("SENTIMENT_TIMEOUT_S", 30)
+MAX_SENTIMENT_CHARS = _env_int("MAX_SENTIMENT_CHARS", 2000)
+
+# Output Configuration
+CONSOLE_ROWS = 50
+TRUNCATE_DISPLAY = False
 
 
 def news_item_schema() -> StructType:
@@ -49,6 +62,100 @@ def news_item_schema() -> StructType:
             StructField("fingerprint", StringType(), True),
         ]
     )
+
+
+def sentiment_result_schema() -> StructType:
+    """Schema for sentiment API responses returned from `call_sentiment_api_partition`.
+
+    Fields:
+      - url_hash: String (non-nullable, used as join key)
+      - sentiment_label: String (nullable)
+      - sentiment_score: Double (nullable)
+      - inferred_at: String (nullable, ISO-8601)
+      - error: String (nullable, error message if present)
+    """
+    return StructType(
+        [
+            StructField("url_hash", StringType(), False),
+            StructField("sentiment_label", StringType(), True),
+            StructField("sentiment_score", DoubleType(), True),
+            StructField("inferred_at", StringType(), True),
+            StructField("error", StringType(), True),
+        ]
+    )
+
+
+def build_text_for_sentiment(df) -> F.Column:
+    """Build the text_for_sentiment column with fallback logic and truncation.
+    
+    Prefers summary > title > text_prepped, normalizes whitespace, and truncates
+    to MAX_SENTIMENT_CHARS characters.
+    """
+    raw_text = F.coalesce(F.col("summary"), F.col("title"), F.col("text_prepped"))
+    normalized = F.trim(F.regexp_replace(raw_text, r"\s+", " "))
+    return F.substring(normalized, 1, MAX_SENTIMENT_CHARS)
+
+
+def prepare_base_dataframe(batch_df) -> "DataFrame":
+    """Prepare base dataframe for sentiment enrichment.
+    
+    Selects required fields, adds text_for_sentiment column, filters nulls,
+    and deduplicates on url_hash.
+    """
+    return (
+        batch_df.select(
+            "url_hash",
+            "text_prepped",
+            "title",
+            "author",
+            "text",
+            "summary",
+            "url",
+            "source",
+            "published_at",
+            "scraped_at",
+            "fingerprint",
+        )
+        .withColumn("text_for_sentiment", build_text_for_sentiment(batch_df))
+        .filter(F.col("url_hash").isNotNull() & F.col("text_for_sentiment").isNotNull())
+        .dropDuplicates(["url_hash"])
+    )
+
+
+def call_sentiment_api(spark, base_df) -> "DataFrame":
+    """Call sentiment API via mapPartitions and return enriched dataframe.
+    
+    Handles batching, error handling, and joins results back on url_hash.
+    """
+    rdd = base_df.select("url_hash", "text_for_sentiment").rdd.mapPartitions(
+        lambda it: call_sentiment_api_partition(
+            (
+                {"url_hash": r["url_hash"], "text_for_sentiment": r["text_for_sentiment"]}
+                for r in it
+            ),
+            endpoint=SENTIMENT_ENDPOINT,
+            batch_size=SENTIMENT_BATCH_SIZE,
+            timeout_s=SENTIMENT_TIMEOUT_S,
+        )
+    )
+    return spark.createDataFrame(rdd, schema=sentiment_result_schema())
+
+
+def display_enriched_results(enriched_df, batch_id: int, total: int, error_count: int) -> None:
+    """Display enriched sentiment results to console.
+    
+    Shows key columns: title, url, sentiment_label, sentiment_score, error.
+    """
+    print(
+        f"[enrich] batch_id={batch_id} processed={total} sentiment_errors={error_count}"
+    )
+    enriched_df.select(
+        "title",
+        "url",
+        "sentiment_label",
+        "sentiment_score",
+        "error",
+    ).show(numRows=CONSOLE_ROWS, truncate=TRUNCATE_DISPLAY)
 
 
 def start_news_stream(
@@ -107,66 +214,42 @@ def start_news_stream(
     query.awaitTermination()
 
 
-def check_java_version() -> None:
-    """Check if Java 17 is installed and set as JAVA_HOME.
-    
-    Raises:
-        SystemExit: If Java is not found or wrong version is detected.
+def enrich_sentiment_foreach_batch(batch_df, batch_id) -> None:
+    """Enrich a microbatch with sentiment results from the REST API.
+
+    Orchestrates the enrichment pipeline:
+    1. Prepares base dataframe with text_for_sentiment
+    2. Calls sentiment API via mapPartitions
+    3. Joins sentiment results back on url_hash
+    4. Displays results to console
     """
-    java_home = os.environ.get("JAVA_HOME")
-    
-    if not java_home:
-        print("ERROR: JAVA_HOME is not set.")
-        print("\nPySpark 4.1.1 requires Java 17.")
-        print("\nOn macOS, set JAVA_HOME with:")
-        print("  export JAVA_HOME=$(/usr/libexec/java_home -v 17)")
-        print("\nOr install Java 17:")
-        print("  brew install --cask temurin17")
-        sys.exit(1)
-    
     try:
-        # Check Java version
-        result = subprocess.run(
-            ["java", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        version_output = result.stderr  # java -version outputs to stderr
-        
-        # Parse version number (e.g., "17.0.1" from output)
-        if "version" in version_output:
-            # Extract version string, handling formats like "17.0.1", "1.8.0_xxx", etc.
-            for line in version_output.split('\n'):
-                if 'version' in line:
-                    # Look for quoted version string
-                    import re
-                    match = re.search(r'"(\d+)', line)
-                    if match:
-                        major_version = int(match.group(1))
-                        
-                        if major_version != 17:
-                            print(f"ERROR: Java {major_version} detected, but Java 17 is required.")
-                            print(f"\nCurrent JAVA_HOME: {java_home}")
-                            print("\nPySpark 4.1.1 is compatible with Java 17.")
-                            print("\nOn macOS, set JAVA_HOME to Java 17:")
-                            print("  export JAVA_HOME=$(/usr/libexec/java_home -v 17)")
-                            sys.exit(1)
-                        
-                        print(f"✓ Java 17 detected (JAVA_HOME: {java_home})")
-                        return
-        
-        print("WARNING: Could not determine Java version.")
-        print(f"JAVA_HOME is set to: {java_home}")
-        
-    except FileNotFoundError:
-        print("ERROR: Java executable not found.")
-        print(f"JAVA_HOME is set to: {java_home}")
-        print("\nPlease install Java 17 and ensure it's in your PATH.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"WARNING: Could not verify Java version: {e}")
-        print(f"JAVA_HOME is set to: {java_home}")
+        spark = batch_df.sparkSession
+
+        # Prepare base dataframe
+        base = prepare_base_dataframe(batch_df)
+
+        count_after_filter = base.count()
+        if count_after_filter == 0:
+            print(f"[enrich] batch_id={batch_id} empty after filter; skipping")
+            return
+
+        # Call sentiment API and create dataframe
+        sentiment_df = call_sentiment_api(spark, base)
+
+        # Join sentiment results
+        enriched = base.join(sentiment_df, on="url_hash", how="left")
+        enriched.cache()
+
+        try:
+            # Collect stats and display
+            total = enriched.count()
+            error_count = enriched.filter(F.col("error").isNotNull()).count()
+            display_enriched_results(enriched, batch_id, total, error_count)
+        finally:
+            enriched.unpersist()
+    except Exception as exc:
+        print(f"[enrich] batch_id={batch_id} failed: {exc}")
 
 
 def load_config(config_path: str) -> dict:
@@ -239,65 +322,3 @@ if __name__ == "__main__":
         starting_offsets=starting_offsets,
         kafka_topic=kafka_topic,
     )
-
-
-def enrich_sentiment_foreach_batch(batch_df, batch_id) -> None:
-    """Enrich a microbatch with sentiment results from the REST API.
-
-    The enrichment runs per-partition using batched HTTP calls and joins results
-    back on `url_hash`.
-    """
-    try:
-        spark = batch_df.sparkSession
-
-        base = (
-            batch_df.select(
-                "url_hash",
-                "text_prepped",
-                "title",
-                "author",
-                "text",
-                "summary",
-                "url",
-                "source",
-                "published_at",
-                "scraped_at",
-                "fingerprint",
-            )
-            .filter(F.col("url_hash").isNotNull() & F.col("text_prepped").isNotNull())
-            .dropDuplicates(["url_hash"])
-        )
-
-        count_after_filter = base.count()
-        if count_after_filter == 0:
-            print(f"[enrich] batch_id={batch_id} empty after filter; skipping")
-            return
-
-        rdd = base.select("url_hash", "text_prepped").rdd.mapPartitions(
-            lambda it: call_sentiment_api_partition(
-                (
-                    {"url_hash": r["url_hash"], "text_prepped": r["text_prepped"]}
-                    for r in it
-                ),
-                endpoint=SENTIMENT_ENDPOINT,
-                batch_size=SENTIMENT_BATCH_SIZE,
-                timeout_s=SENTIMENT_TIMEOUT_S,
-            )
-        )
-
-        sentiment_df = spark.createDataFrame(rdd)
-        enriched = base.join(sentiment_df, on="url_hash", how="left")
-        enriched.cache()
-
-        try:
-            total = enriched.count()
-            error_count = enriched.filter(F.col("error").isNotNull()).count()
-            print(
-                f"[enrich] batch_id={batch_id} processed={total} sentiment_errors={error_count}"
-            )
-
-            enriched.show(truncate=False)
-        finally:
-            enriched.unpersist()
-    except Exception as exc:
-        print(f"[enrich] batch_id={batch_id} failed: {exc}")

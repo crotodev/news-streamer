@@ -18,7 +18,7 @@ def call_sentiment_api_partition(
     """Call the sentiment API in batches per partition.
 
     Args:
-        rows_iter: Iterable of dictionaries with keys `url_hash` and `text_prepped`.
+        rows_iter: Iterable of dictionaries with keys `url_hash` and `text_for_sentiment`.
         endpoint: REST endpoint to POST the batch payload.
         batch_size: Maximum number of records per HTTP batch.
         timeout_s: Request timeout in seconds.
@@ -45,9 +45,29 @@ def call_sentiment_api_partition(
         if not batch:
             return iter(())
 
+        # Filter out empty text items; yield error rows for them
+        valid_items = []
+        for item in batch:
+            text = item.get("text_for_sentiment", "")
+            if text and isinstance(text, str) and text.strip():
+                valid_items.append(item)
+            else:
+                # Yield error row for empty text
+                yield Row(
+                    url_hash=item["url_hash"],
+                    sentiment_label=None,
+                    sentiment_score=None,
+                    inferred_at=_utc_now_iso(),
+                    error="empty_text_for_sentiment",
+                )
+
+        if not valid_items:
+            return
+
         payload = {
             "items": [
-                {"id": item["url_hash"], "text": item["text_prepped"]} for item in batch
+                {"id": item["url_hash"], "text": item["text_for_sentiment"]}
+                for item in valid_items
             ]
         }
         inferred_at = _utc_now_iso()
@@ -63,7 +83,7 @@ def call_sentiment_api_partition(
                 if isinstance(entry, dict) and entry.get("id") is not None
             }
 
-            for item in batch:
+            for item in valid_items:
                 result = results_by_id.get(item["url_hash"])
                 if result:
                     yield Row(
@@ -82,7 +102,7 @@ def call_sentiment_api_partition(
                         error="missing sentiment result",
                     )
         except Exception as exc:  # noqa: BLE001
-            yield from emit_error_rows(batch, str(exc))
+            yield from emit_error_rows(valid_items, str(exc))
 
     for row in rows_iter:
         buffer.append(row)

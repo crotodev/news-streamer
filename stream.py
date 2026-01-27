@@ -181,8 +181,8 @@ def start_news_stream(
     starting_offsets: str = "latest",
     kafka_topic: str = "raw_news",
     write_parquet: bool = True,
+    write_kafka: bool = False,
     parquet_output_dir: str = PARQUET_OUTPUT_DIR,
-    parquet_checkpoint_dir: str = PARQUET_CHECKPOINT_DIR,
 ) -> None:
     """Start a Structured Streaming query consuming `raw_news` and parsing with `news_item_schema`.
 
@@ -192,8 +192,8 @@ def start_news_stream(
         starting_offsets: Kafka starting offsets ("earliest" or "latest"). Defaults to "latest".
         kafka_topic: Kafka topic name to subscribe to. Defaults to "raw_news".
         write_parquet: Whether to write parsed/enriched rows to Parquet in append mode.
+        write_kafka: Whether to write enriched data to Kafka "enriched_news" topic.
         parquet_output_dir: Filesystem path for Parquet output.
-        parquet_checkpoint_dir: Filesystem path for Parquet sink checkpointing.
     """
 
     kafka_packages = (
@@ -235,6 +235,8 @@ def start_news_stream(
             make_foreach_batch_writer(
                 parquet_output_dir=parquet_output_dir,
                 write_parquet=write_parquet,
+                bootstrap_servers=bootstrap_servers,
+                write_kafka=write_kafka,
             )
         )
         .start()
@@ -243,26 +245,29 @@ def start_news_stream(
     sentiment_query.awaitTermination()
 
 
-def make_foreach_batch_writer(parquet_output_dir: str, write_parquet: bool)-> Callable[..., None]:
+def make_foreach_batch_writer(parquet_output_dir: str, write_parquet: bool, bootstrap_servers: str = None, write_kafka: bool = False) -> Callable[..., None]:
     """Factory function that returns a foreachBatch writer function.
 
     Args:
         parquet_output_dir: Directory to write enriched Parquet files to.
         write_parquet: Whether to write enriched Parquet files.
+        bootstrap_servers: Kafka bootstrap servers for writing enriched data.
+        write_kafka: Whether to write enriched data to Kafka topic "enriched_news".
 
     Returns:
-        A function (batch_df, batch_id) -> None that enriches and optionally writes Parquet.
+        A function (batch_df, batch_id) -> None that enriches and optionally writes Parquet/Kafka.
     """
 
     def foreach_batch_writer(batch_df, batch_id) -> None:
-        """Enrich a microbatch with sentiment results and optionally write to Parquet.
+        """Enrich a microbatch with sentiment results and optionally write to Parquet/Kafka.
 
         Orchestrates the enrichment pipeline:
         1. Prepares base dataframe with text_for_sentiment
         2. Calls sentiment API via mapPartitions
         3. Joins sentiment results back on url_hash
         4. Optionally writes enriched results to Parquet, partitioned by ingest_date
-        5. Displays results to console
+        5. Optionally writes enriched results to Kafka "enriched_news" topic
+        6. Displays results to console
         """
         try:
             spark = batch_df.sparkSession
@@ -295,6 +300,21 @@ def make_foreach_batch_writer(parquet_output_dir: str, write_parquet: bool)-> Ca
                     enriched_with_date.write.mode("append").partitionBy(
                         "ingest_date"
                     ).parquet(parquet_output_dir)
+
+                # Write enriched data to Kafka if enabled
+                if write_kafka and bootstrap_servers:
+                    enriched_to_kafka = enriched.select(
+                        F.to_json(
+                            F.struct(
+                                "title", "author", "text", "summary", "url", "source",
+                                "published_at", "scraped_at", "url_hash", "fingerprint",
+                                "sentiment_label", "sentiment_score", "inferred_at", "error"
+                            )
+                        ).alias("value")
+                    )
+                    enriched_to_kafka.write.format("kafka").option(
+                        "kafka.bootstrap.servers", bootstrap_servers
+                    ).option("topic", "enriched_news").mode("append").save()
 
                 # Display results to console
                 display_enriched_results(enriched, batch_id, total, error_count)
@@ -367,6 +387,19 @@ if __name__ == "__main__":
     )
     parser.set_defaults(write_parquet=None)
     parser.add_argument(
+        "--write-kafka",
+        dest="write_kafka",
+        action="store_true",
+        help="Enable Kafka sink to enriched_news topic (default: false; overrides config file)",
+    )
+    parser.add_argument(
+        "--no-write-kafka",
+        dest="write_kafka",
+        action="store_false",
+        help="Disable Kafka sink (overrides config file)",
+    )
+    parser.set_defaults(write_kafka=None)
+    parser.add_argument(
         "--starting-offsets",
         type=str,
         choices=["earliest", "latest"],
@@ -394,6 +427,11 @@ if __name__ == "__main__":
         if args.write_parquet is not None
         else _coerce_bool(parquet_config.get("enabled"), True)
     )
+    write_kafka = (
+        args.write_kafka
+        if args.write_kafka is not None
+        else _coerce_bool(config.get("kafka", {}).get("write_enriched"), False)
+    )
     parquet_output_dir = (
         args.parquet_output_dir
         or parquet_config.get("output_dir")
@@ -415,6 +453,6 @@ if __name__ == "__main__":
         starting_offsets=starting_offsets,
         kafka_topic=kafka_topic,
         write_parquet=write_parquet,
+        write_kafka=write_kafka,
         parquet_output_dir=parquet_output_dir,
-        parquet_checkpoint_dir=parquet_checkpoint_dir,
     )

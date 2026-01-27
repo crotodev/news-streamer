@@ -1,7 +1,6 @@
 import argparse
 import os
-import subprocess
-import sys
+from typing import Callable
 
 import yaml
 from pyspark.sql import SparkSession, functions as F
@@ -27,6 +26,20 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _coerce_bool(value, default: bool) -> bool:
+    """Best-effort boolean coercion from config/env values."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
 # Sentiment API Configuration
 SENTIMENT_ENDPOINT = os.environ.get(
     "SENTIMENT_ENDPOINT", "http://localhost:9000/api/sentiment/batch"
@@ -38,6 +51,10 @@ MAX_SENTIMENT_CHARS = _env_int("MAX_SENTIMENT_CHARS", 2000)
 # Output Configuration
 CONSOLE_ROWS = 50
 TRUNCATE_DISPLAY = False
+
+# Parquet sink defaults
+PARQUET_OUTPUT_DIR = "./data/parquet/news_enriched"
+PARQUET_CHECKPOINT_DIR = "./data/checkpoints/news_enriched_parquet"
 
 
 def news_item_schema() -> StructType:
@@ -118,7 +135,7 @@ def prepare_base_dataframe(batch_df) -> "DataFrame":
         )
         .withColumn("text_for_sentiment", build_text_for_sentiment(batch_df))
         .filter(F.col("url_hash").isNotNull() & F.col("text_for_sentiment").isNotNull())
-        .dropDuplicates(["url_hash"])
+        .dropDuplicates(["url_hash", "fingerprint"])
     )
 
 
@@ -155,7 +172,7 @@ def display_enriched_results(enriched_df, batch_id: int, total: int, error_count
         "sentiment_label",
         "sentiment_score",
         "error",
-    ).show(numRows=CONSOLE_ROWS, truncate=TRUNCATE_DISPLAY)
+    ).show(n=CONSOLE_ROWS, truncate=TRUNCATE_DISPLAY)
 
 
 def start_news_stream(
@@ -163,6 +180,9 @@ def start_news_stream(
     checkpoint_location: str,
     starting_offsets: str = "latest",
     kafka_topic: str = "raw_news",
+    write_parquet: bool = True,
+    parquet_output_dir: str = PARQUET_OUTPUT_DIR,
+    parquet_checkpoint_dir: str = PARQUET_CHECKPOINT_DIR,
 ) -> None:
     """Start a Structured Streaming query consuming `raw_news` and parsing with `news_item_schema`.
 
@@ -171,6 +191,9 @@ def start_news_stream(
         checkpoint_location: Filesystem path for Spark checkpoints.
         starting_offsets: Kafka starting offsets ("earliest" or "latest"). Defaults to "latest".
         kafka_topic: Kafka topic name to subscribe to. Defaults to "raw_news".
+        write_parquet: Whether to write parsed/enriched rows to Parquet in append mode.
+        parquet_output_dir: Filesystem path for Parquet output.
+        parquet_checkpoint_dir: Filesystem path for Parquet sink checkpointing.
     """
 
     kafka_packages = (
@@ -203,53 +226,84 @@ def start_news_stream(
         )
     )
 
-    query = (
+    # Sentiment enrichment and Parquet writing via foreachBatch
+    sentiment_query = (
         parsed_df.writeStream
         .option("checkpointLocation", checkpoint_location)
         .outputMode("append")
-        .foreachBatch(enrich_sentiment_foreach_batch)
+        .foreachBatch(
+            make_foreach_batch_writer(
+                parquet_output_dir=parquet_output_dir,
+                write_parquet=write_parquet,
+            )
+        )
         .start()
     )
 
-    query.awaitTermination()
+    sentiment_query.awaitTermination()
 
 
-def enrich_sentiment_foreach_batch(batch_df, batch_id) -> None:
-    """Enrich a microbatch with sentiment results from the REST API.
+def make_foreach_batch_writer(parquet_output_dir: str, write_parquet: bool)-> Callable[..., None]:
+    """Factory function that returns a foreachBatch writer function.
 
-    Orchestrates the enrichment pipeline:
-    1. Prepares base dataframe with text_for_sentiment
-    2. Calls sentiment API via mapPartitions
-    3. Joins sentiment results back on url_hash
-    4. Displays results to console
+    Args:
+        parquet_output_dir: Directory to write enriched Parquet files to.
+        write_parquet: Whether to write enriched Parquet files.
+
+    Returns:
+        A function (batch_df, batch_id) -> None that enriches and optionally writes Parquet.
     """
-    try:
-        spark = batch_df.sparkSession
 
-        # Prepare base dataframe
-        base = prepare_base_dataframe(batch_df)
+    def foreach_batch_writer(batch_df, batch_id) -> None:
+        """Enrich a microbatch with sentiment results and optionally write to Parquet.
 
-        count_after_filter = base.count()
-        if count_after_filter == 0:
-            print(f"[enrich] batch_id={batch_id} empty after filter; skipping")
-            return
-
-        # Call sentiment API and create dataframe
-        sentiment_df = call_sentiment_api(spark, base)
-
-        # Join sentiment results
-        enriched = base.join(sentiment_df, on="url_hash", how="left")
-        enriched.cache()
-
+        Orchestrates the enrichment pipeline:
+        1. Prepares base dataframe with text_for_sentiment
+        2. Calls sentiment API via mapPartitions
+        3. Joins sentiment results back on url_hash
+        4. Optionally writes enriched results to Parquet, partitioned by ingest_date
+        5. Displays results to console
+        """
         try:
-            # Collect stats and display
-            total = enriched.count()
-            error_count = enriched.filter(F.col("error").isNotNull()).count()
-            display_enriched_results(enriched, batch_id, total, error_count)
-        finally:
-            enriched.unpersist()
-    except Exception as exc:
-        print(f"[enrich] batch_id={batch_id} failed: {exc}")
+            spark = batch_df.sparkSession
+
+            # Prepare base dataframe
+            base = prepare_base_dataframe(batch_df)
+
+            count_after_filter = base.count()
+            if count_after_filter == 0:
+                print(f"[enrich] batch_id={batch_id} empty after filter; skipping")
+                return
+
+            # Call sentiment API and create dataframe
+            sentiment_df = call_sentiment_api(spark, base)
+
+            # Join sentiment results
+            enriched = base.join(sentiment_df, on="url_hash", how="left")
+            enriched.cache()
+
+            try:
+                # Collect stats
+                total = enriched.count()
+                error_count = enriched.filter(F.col("error").isNotNull()).count()
+
+                # Write enriched data to Parquet if enabled
+                if write_parquet:
+                    ingest_date = F.to_date(F.current_timestamp())
+                    enriched_with_date = enriched.withColumn("ingest_date", ingest_date)
+                    os.makedirs(parquet_output_dir, exist_ok=True)
+                    enriched_with_date.write.mode("append").partitionBy(
+                        "ingest_date"
+                    ).parquet(parquet_output_dir)
+
+                # Display results to console
+                display_enriched_results(enriched, batch_id, total, error_count)
+            finally:
+                enriched.unpersist()
+        except Exception as exc:
+            print(f"[enrich] batch_id={batch_id} failed: {exc}")
+
+    return foreach_batch_writer
 
 
 def load_config(config_path: str) -> dict:
@@ -290,6 +344,29 @@ if __name__ == "__main__":
         help="Spark checkpoint location (overrides config file)",
     )
     parser.add_argument(
+        "--parquet-output-dir",
+        type=str,
+        help="Parquet output directory (overrides config file)",
+    )
+    parser.add_argument(
+        "--parquet-checkpoint-dir",
+        type=str,
+        help="Parquet checkpoint directory (overrides config file)",
+    )
+    parser.add_argument(
+        "--write-parquet",
+        dest="write_parquet",
+        action="store_true",
+        help="Enable Parquet sink (default: true; overrides config file)",
+    )
+    parser.add_argument(
+        "--no-write-parquet",
+        dest="write_parquet",
+        action="store_false",
+        help="Disable Parquet sink (overrides config file)",
+    )
+    parser.set_defaults(write_parquet=None)
+    parser.add_argument(
         "--starting-offsets",
         type=str,
         choices=["earliest", "latest"],
@@ -311,6 +388,22 @@ if __name__ == "__main__":
     checkpoint_location = args.checkpoint_location or config.get("spark", {}).get(
         "checkpoint_location", "/tmp/raw_news_checkpoints"
     )
+    parquet_config = config.get("parquet", {})
+    write_parquet = (
+        args.write_parquet
+        if args.write_parquet is not None
+        else _coerce_bool(parquet_config.get("enabled"), True)
+    )
+    parquet_output_dir = (
+        args.parquet_output_dir
+        or parquet_config.get("output_dir")
+        or PARQUET_OUTPUT_DIR
+    )
+    parquet_checkpoint_dir = (
+        args.parquet_checkpoint_dir
+        or parquet_config.get("checkpoint_dir")
+        or PARQUET_CHECKPOINT_DIR
+    )
     starting_offsets = args.starting_offsets or config.get("kafka", {}).get(
         "starting_offsets", "latest"
     )
@@ -321,4 +414,7 @@ if __name__ == "__main__":
         checkpoint_location=checkpoint_location,
         starting_offsets=starting_offsets,
         kafka_topic=kafka_topic,
+        write_parquet=write_parquet,
+        parquet_output_dir=parquet_output_dir,
+        parquet_checkpoint_dir=parquet_checkpoint_dir,
     )

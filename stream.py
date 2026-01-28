@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Callable
+from typing import Callable, List
 
 import yaml
 from pyspark.sql import SparkSession, functions as F
@@ -14,6 +14,7 @@ from pyspark.sql.types import (
 
 from checks import check_java_version, ensure_kafka_topic
 from sentiment_client import call_sentiment_api_partition
+from sinks import Sink, ParquetSink, KafkaSink
 
 
 def _env_int(name: str, default: int) -> int:
@@ -104,7 +105,7 @@ def sentiment_result_schema() -> StructType:
 
 def build_text_for_sentiment(df) -> F.Column:
     """Build the text_for_sentiment column with fallback logic and truncation.
-    
+
     Prefers summary > title > text_prepped, normalizes whitespace, and truncates
     to MAX_SENTIMENT_CHARS characters.
     """
@@ -115,7 +116,7 @@ def build_text_for_sentiment(df) -> F.Column:
 
 def prepare_base_dataframe(batch_df) -> "DataFrame":
     """Prepare base dataframe for sentiment enrichment.
-    
+
     Selects required fields, adds text_for_sentiment column, filters nulls,
     and deduplicates on url_hash.
     """
@@ -141,13 +142,16 @@ def prepare_base_dataframe(batch_df) -> "DataFrame":
 
 def call_sentiment_api(spark, base_df) -> "DataFrame":
     """Call sentiment API via mapPartitions and return enriched dataframe.
-    
+
     Handles batching, error handling, and joins results back on url_hash.
     """
     rdd = base_df.select("url_hash", "text_for_sentiment").rdd.mapPartitions(
         lambda it: call_sentiment_api_partition(
             (
-                {"url_hash": r["url_hash"], "text_for_sentiment": r["text_for_sentiment"]}
+                {
+                    "url_hash": r["url_hash"],
+                    "text_for_sentiment": r["text_for_sentiment"],
+                }
                 for r in it
             ),
             endpoint=SENTIMENT_ENDPOINT,
@@ -158,9 +162,11 @@ def call_sentiment_api(spark, base_df) -> "DataFrame":
     return spark.createDataFrame(rdd, schema=sentiment_result_schema())
 
 
-def display_enriched_results(enriched_df, batch_id: int, total: int, error_count: int) -> None:
+def display_enriched_results(
+    enriched_df, batch_id: int, total: int, error_count: int
+) -> None:
     """Display enriched sentiment results to console.
-    
+
     Shows key columns: title, url, sentiment_label, sentiment_score, error.
     """
     print(
@@ -175,25 +181,46 @@ def display_enriched_results(enriched_df, batch_id: int, total: int, error_count
     ).show(n=CONSOLE_ROWS, truncate=TRUNCATE_DISPLAY)
 
 
+def build_sinks_from_config(
+    write_parquet: bool,
+    write_kafka: bool,
+    parquet_output_dir: str,
+    bootstrap_servers: str = None,
+) -> List[Sink]:
+    """Build a list of sinks from legacy configuration flags.
+
+    Args:
+        write_parquet: Whether to enable Parquet sink.
+        write_kafka: Whether to enable Kafka sink.
+        parquet_output_dir: Directory for Parquet output.
+        bootstrap_servers: Kafka bootstrap servers.
+
+    Returns:
+        List of configured Sink objects.
+    """
+    sinks = []
+    if write_parquet:
+        sinks.append(ParquetSink(parquet_output_dir))
+    if write_kafka and bootstrap_servers:
+        sinks.append(KafkaSink(bootstrap_servers))
+    return sinks
+
+
 def start_news_stream(
     bootstrap_servers: str,
     checkpoint_location: str,
+    sinks: List[Sink],
     starting_offsets: str = "latest",
     kafka_topic: str = "raw_news",
-    write_parquet: bool = True,
-    write_kafka: bool = False,
-    parquet_output_dir: str = PARQUET_OUTPUT_DIR,
 ) -> None:
     """Start a Structured Streaming query consuming `raw_news` and parsing with `news_item_schema`.
 
     Args:
         bootstrap_servers: Kafka bootstrap servers, e.g. "localhost:9092" or "host1:9092,host2:9092".
         checkpoint_location: Filesystem path for Spark checkpoints.
+        sinks: List of Sink objects to write enriched data to.
         starting_offsets: Kafka starting offsets ("earliest" or "latest"). Defaults to "latest".
         kafka_topic: Kafka topic name to subscribe to. Defaults to "raw_news".
-        write_parquet: Whether to write parsed/enriched rows to Parquet in append mode.
-        write_kafka: Whether to write enriched data to Kafka "enriched_news" topic.
-        parquet_output_dir: Filesystem path for Parquet output.
     """
 
     kafka_packages = (
@@ -229,48 +256,36 @@ def start_news_stream(
         )
     )
 
-    # Sentiment enrichment and Parquet writing via foreachBatch
+    # Sentiment enrichment and writing via foreachBatch with custom sinks
     sentiment_query = (
-        parsed_df.writeStream
-        .option("checkpointLocation", checkpoint_location)
+        parsed_df.writeStream.option("checkpointLocation", checkpoint_location)
         .outputMode("append")
-        .foreachBatch(
-            make_foreach_batch_writer(
-                parquet_output_dir=parquet_output_dir,
-                write_parquet=write_parquet,
-                bootstrap_servers=bootstrap_servers,
-                write_kafka=write_kafka,
-            )
-        )
+        .foreachBatch(make_foreach_batch_writer(sinks=sinks))
         .start()
     )
 
     sentiment_query.awaitTermination()
 
 
-def make_foreach_batch_writer(parquet_output_dir: str, write_parquet: bool, bootstrap_servers: str = None, write_kafka: bool = False) -> Callable[..., None]:
+def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
     """Factory function that returns a foreachBatch writer function.
 
     Args:
-        parquet_output_dir: Directory to write enriched Parquet files to.
-        write_parquet: Whether to write enriched Parquet files.
-        bootstrap_servers: Kafka bootstrap servers for writing enriched data.
-        write_kafka: Whether to write enriched data to Kafka topic "enriched_news".
+        sinks: List of Sink objects to write enriched data to.
 
     Returns:
-        A function (batch_df, batch_id) -> None that enriches and optionally writes Parquet/Kafka.
+        A function (batch_df, batch_id) -> None that enriches and writes to all configured sinks.
     """
 
     def foreach_batch_writer(batch_df, batch_id) -> None:
-        """Enrich a microbatch with sentiment results and optionally write to Parquet/Kafka.
+        """Enrich a microbatch with sentiment results and write to all configured sinks.
 
         Orchestrates the enrichment pipeline:
         1. Prepares base dataframe with text_for_sentiment
         2. Calls sentiment API via mapPartitions
         3. Joins sentiment results back on url_hash
-        4. Optionally writes enriched results to Parquet, partitioned by ingest_date
-        5. Optionally writes enriched results to Kafka "enriched_news" topic
-        6. Displays results to console
+        4. Writes enriched results to all configured sinks
+        5. Displays results to console
         """
         try:
             spark = batch_df.sparkSession
@@ -295,29 +310,14 @@ def make_foreach_batch_writer(parquet_output_dir: str, write_parquet: bool, boot
                 total = enriched.count()
                 error_count = enriched.filter(F.col("error").isNotNull()).count()
 
-                # Write enriched data to Parquet if enabled
-                if write_parquet:
-                    ingest_date = F.to_date(F.current_timestamp())
-                    enriched_with_date = enriched.withColumn("ingest_date", ingest_date)
-                    os.makedirs(parquet_output_dir, exist_ok=True)
-                    enriched_with_date.write.mode("append").partitionBy(
-                        "ingest_date"
-                    ).parquet(parquet_output_dir)
-
-                # Write enriched data to Kafka if enabled
-                if write_kafka and bootstrap_servers:
-                    enriched_to_kafka = enriched.select(
-                        F.to_json(
-                            F.struct(
-                                "title", "author", "text", "summary", "url", "source",
-                                "published_at", "scraped_at", "url_hash", "fingerprint",
-                                "sentiment_label", "sentiment_score", "inferred_at", "error"
-                            )
-                        ).alias("value")
-                    )
-                    enriched_to_kafka.write.format("kafka").option(
-                        "kafka.bootstrap.servers", bootstrap_servers
-                    ).option("topic", "enriched_news").mode("append").save()
+                # Write to all configured sinks
+                for sink in sinks:
+                    try:
+                        sink.write(enriched, batch_id)
+                    except Exception as sink_exc:
+                        print(
+                            f"[enrich] batch_id={batch_id} sink {type(sink).__name__} failed: {sink_exc}"
+                        )
 
                 # Display results to console
                 display_enriched_results(enriched, batch_id, total, error_count)
@@ -345,7 +345,7 @@ def load_config(config_path: str) -> dict:
 if __name__ == "__main__":
     # Check Java version before proceeding
     check_java_version()
-    
+
     parser = argparse.ArgumentParser(
         description="Stream news from Kafka to console",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -450,12 +450,18 @@ if __name__ == "__main__":
     )
     kafka_topic = config.get("kafka", {}).get("topic", "raw_news")
 
-    start_news_stream(
-        bootstrap_servers=bootstrap_servers,
-        checkpoint_location=checkpoint_location,
-        starting_offsets=starting_offsets,
-        kafka_topic=kafka_topic,
+    # Build sinks from configuration
+    sinks = build_sinks_from_config(
         write_parquet=write_parquet,
         write_kafka=write_kafka,
         parquet_output_dir=parquet_output_dir,
+        bootstrap_servers=bootstrap_servers,
+    )
+
+    start_news_stream(
+        bootstrap_servers=bootstrap_servers,
+        checkpoint_location=checkpoint_location,
+        sinks=sinks,
+        starting_offsets=starting_offsets,
+        kafka_topic=kafka_topic,
     )

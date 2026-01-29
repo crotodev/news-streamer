@@ -5,11 +5,11 @@ from typing import Callable, List
 import yaml
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import (
-    DoubleType,
     StructField,
     StructType,
     StringType,
-    TimestampType,
+    IntegerType,
+    BooleanType,
 )
 
 from checks import check_java_version, ensure_kafka_topic
@@ -58,52 +58,52 @@ PARQUET_OUTPUT_DIR = "./data/parquet/news_enriched"
 PARQUET_CHECKPOINT_DIR = "./data/checkpoints/news_enriched_parquet"
 
 
-def news_item_schema() -> StructType:
-    """Return a StructType matching `NewsItem` fields.
-
-    Fields:
-      - title, author, text, summary, url, source, url_hash, fingerprint: String
-      - published_at, scraped_at: Timestamp (nullable; expect ISO-8601 strings)
-    """
-
-    return StructType(
-        [
-            StructField("title", StringType(), True),
-            StructField("author", StringType(), True),
-            StructField("text", StringType(), True),
-            StructField("summary", StringType(), True),
-            StructField("url", StringType(), True),
-            StructField("source", StringType(), True),
-            StructField("published_at", TimestampType(), True),
-            StructField("scraped_at", TimestampType(), True),
-            StructField("url_hash", StringType(), True),
-            StructField("fingerprint", StringType(), True),
-        ]
-    )
-
-
 def sentiment_result_schema() -> StructType:
-    """Schema for sentiment API responses returned from `call_sentiment_api_partition`.
+    """Return a StructType for sentiment API results."""
 
-    Fields:
-      - url_hash: String (non-nullable, used as join key)
-      - sentiment_label: String (nullable)
-      - sentiment_score: Double (nullable)
-      - inferred_at: String (nullable, ISO-8601)
-      - error: String (nullable, error message if present)
-    """
     return StructType(
         [
-            StructField("url_hash", StringType(), False),
-            StructField("sentiment_label", StringType(), True),
-            StructField("sentiment_score", DoubleType(), True),
-            StructField("inferred_at", StringType(), True),
-            StructField("error", StringType(), True),
+            StructField("url_hash", StringType(), nullable=False),
+            StructField("sentiment_label", StringType(), nullable=True),
+            StructField("sentiment_score", StringType(), nullable=True),
+            StructField("error", StringType(), nullable=True),
         ]
     )
 
 
-def build_text_for_sentiment(df) -> F.Column:
+def news_item_schema() -> StructType:
+    """Return a StructType matching `NewsItem` fields."""
+
+    return StructType(
+        [
+            # === Core content fields ===
+            StructField("title", StringType(), nullable=True),
+            StructField("author", StringType(), nullable=True),
+            StructField("text", StringType(), nullable=True),
+            StructField("summary", StringType(), nullable=True),
+            StructField("url", StringType(), nullable=False),
+            StructField("source", StringType(), nullable=False),
+            # === Timestamps (ISO-8601 UTC strings) ===
+            StructField("published_at", StringType(), nullable=True),
+            StructField("scraped_at", StringType(), nullable=False),
+            # === Deduplication fields ===
+            StructField("url_hash", StringType(), nullable=False),
+            StructField("fingerprint", StringType(), nullable=False),
+            # === Author extraction metadata ===
+            StructField("author_source", StringType(), nullable=False),
+            # === Summary metadata ===
+            StructField("summary_max_chars", IntegerType(), nullable=False),
+            StructField("summary_truncated", BooleanType(), nullable=False),
+            # === Parse debug fields ===
+            StructField("parse_ok", BooleanType(), nullable=False),
+            StructField("parse_error", StringType(), nullable=True),
+            StructField("extraction_method", StringType(), nullable=False),
+            StructField("content_length_chars", IntegerType(), nullable=False),
+        ]
+    )
+
+
+def build_text_for_sentiment() -> F.Column:
     """Build the text_for_sentiment column with fallback logic and truncation.
 
     Prefers summary > title > text_prepped, normalizes whitespace, and truncates
@@ -134,7 +134,7 @@ def prepare_base_dataframe(batch_df) -> "DataFrame":
             "scraped_at",
             "fingerprint",
         )
-        .withColumn("text_for_sentiment", build_text_for_sentiment(batch_df))
+        .withColumn("text_for_sentiment", build_text_for_sentiment())
         .filter(F.col("url_hash").isNotNull() & F.col("text_for_sentiment").isNotNull())
         .dropDuplicates(["url_hash", "fingerprint"])
     )

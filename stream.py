@@ -1,19 +1,21 @@
 import argparse
 import os
+import time
 from typing import Callable, List
 
+import requests
 import yaml
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import (
+    DoubleType,
     StructField,
     StructType,
     StringType,
-    IntegerType,
-    BooleanType,
+    TimestampType,
 )
 
 from checks import check_java_version, ensure_kafka_topic
-from sentiment_client import call_sentiment_api_partition
+from api_client import call_sentiment_api_partition, call_classify_api_partition
 from sinks import Sink, ParquetSink, KafkaSink
 
 
@@ -41,13 +43,27 @@ def _coerce_bool(value, default: bool) -> bool:
     return default
 
 
-# Sentiment API Configuration
+# API Base Configuration
+API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:9000")
 SENTIMENT_ENDPOINT = os.environ.get(
-    "SENTIMENT_ENDPOINT", "http://localhost:9000/api/sentiment/batch"
+    "SENTIMENT_ENDPOINT", f"{API_BASE_URL}/api/sentiment/batch"
 )
-SENTIMENT_BATCH_SIZE = _env_int("SENTIMENT_BATCH_SIZE", 25)
-SENTIMENT_TIMEOUT_S = _env_int("SENTIMENT_TIMEOUT_S", 30)
-MAX_SENTIMENT_CHARS = _env_int("MAX_SENTIMENT_CHARS", 2000)
+CLASSIFY_ENDPOINT = os.environ.get(
+    "CLASSIFY_ENDPOINT", f"{API_BASE_URL}/api/classify/batch"
+)
+API_HEALTH_ENDPOINT = os.environ.get(
+    "API_HEALTH_ENDPOINT", f"{API_BASE_URL}/health"
+)
+
+# Inference API Configuration
+INFERENCE_BATCH_SIZE = _env_int("INFERENCE_BATCH_SIZE", 25)
+INFERENCE_TIMEOUT_S = _env_int("INFERENCE_TIMEOUT_S", 30)
+MAX_INFER_CHARS = _env_int("MAX_INFER_CHARS", 2000)
+
+# API Readiness Configuration
+API_READY_MAX_WAIT_S = _env_int("API_READY_MAX_WAIT_S", 60)
+API_READY_INTERVAL_S = _env_int("API_READY_INTERVAL_S", 2)
+API_READY_TIMEOUT_S = _env_int("API_READY_TIMEOUT_S", 2)  # Per-request timeout for readiness check
 
 # Output Configuration
 CONSOLE_ROWS = 50
@@ -58,66 +74,140 @@ PARQUET_OUTPUT_DIR = "./data/parquet/news_enriched"
 PARQUET_CHECKPOINT_DIR = "./data/checkpoints/news_enriched_parquet"
 
 
-def sentiment_result_schema() -> StructType:
-    """Return a StructType for sentiment API results."""
+def wait_for_api_ready(
+    ready_url: str,
+    timeout_s: int = API_READY_MAX_WAIT_S,
+    interval_s: int = API_READY_INTERVAL_S,
+) -> None:
+    """Wait for the inference API to become ready.
 
-    return StructType(
-        [
-            StructField("url_hash", StringType(), nullable=False),
-            StructField("sentiment_label", StringType(), nullable=True),
-            StructField("sentiment_score", StringType(), nullable=True),
-            StructField("error", StringType(), nullable=True),
-        ]
+    Polls the health/ready endpoint until a successful response is received
+    or the timeout is exceeded.
+
+    Args:
+        ready_url: URL of the API health/ready endpoint.
+        timeout_s: Maximum time to wait in seconds.
+        interval_s: Interval between retry attempts in seconds.
+
+    Raises:
+        RuntimeError: If the API is not ready within the timeout period.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        print(f"[api] waiting for readiness: {ready_url} ...")
+        try:
+            response = requests.get(ready_url, timeout=API_READY_TIMEOUT_S)
+            if response.status_code in (200, 204):
+                print(f"[api] API is ready at {ready_url}")
+                return
+        except requests.exceptions.RequestException:
+            pass  # Connection error, keep retrying
+        time.sleep(interval_s)
+
+    raise RuntimeError(
+        f"Inference API not ready after {timeout_s}s. URL: {ready_url}"
     )
+
+
+def is_api_ready(ready_url: str = API_HEALTH_ENDPOINT) -> bool:
+    """Check if the inference API is currently ready.
+
+    Performs a single lightweight health check with a short timeout.
+
+    Args:
+        ready_url: URL of the API health/ready endpoint.
+
+    Returns:
+        True if the API responds with HTTP 200/204, False otherwise.
+    """
+    try:
+        response = requests.get(ready_url, timeout=API_READY_TIMEOUT_S)
+        return response.status_code in (200, 204)
+    except requests.exceptions.RequestException:
+        return False
 
 
 def news_item_schema() -> StructType:
-    """Return a StructType matching `NewsItem` fields."""
+    """Return a StructType matching `NewsItem` fields.
+
+    Fields:
+      - title, author, text, summary, url, source, url_hash, fingerprint: String
+      - published_at, scraped_at: Timestamp (nullable; expect ISO-8601 strings)
+    """
 
     return StructType(
         [
-            # === Core content fields ===
-            StructField("title", StringType(), nullable=True),
-            StructField("author", StringType(), nullable=True),
-            StructField("text", StringType(), nullable=True),
-            StructField("summary", StringType(), nullable=True),
-            StructField("url", StringType(), nullable=False),
-            StructField("source", StringType(), nullable=False),
-            # === Timestamps (ISO-8601 UTC strings) ===
-            StructField("published_at", StringType(), nullable=True),
-            StructField("scraped_at", StringType(), nullable=False),
-            # === Deduplication fields ===
-            StructField("url_hash", StringType(), nullable=False),
-            StructField("fingerprint", StringType(), nullable=False),
-            # === Author extraction metadata ===
-            StructField("author_source", StringType(), nullable=False),
-            # === Summary metadata ===
-            StructField("summary_max_chars", IntegerType(), nullable=False),
-            StructField("summary_truncated", BooleanType(), nullable=False),
-            # === Parse debug fields ===
-            StructField("parse_ok", BooleanType(), nullable=False),
-            StructField("parse_error", StringType(), nullable=True),
-            StructField("extraction_method", StringType(), nullable=False),
-            StructField("content_length_chars", IntegerType(), nullable=False),
+            StructField("title", StringType(), True),
+            StructField("author", StringType(), True),
+            StructField("text", StringType(), True),
+            StructField("summary", StringType(), True),
+            StructField("url", StringType(), True),
+            StructField("source", StringType(), True),
+            StructField("published_at", TimestampType(), True),
+            StructField("scraped_at", TimestampType(), True),
+            StructField("url_hash", StringType(), True),
+            StructField("fingerprint", StringType(), True),
         ]
     )
 
 
-def build_text_for_sentiment() -> F.Column:
-    """Build the text_for_sentiment column with fallback logic and truncation.
+def sentiment_result_schema() -> StructType:
+    """Schema for sentiment API responses returned from `call_sentiment_api_partition`.
+
+    Fields:
+      - url_hash: String (non-nullable, used as join key)
+      - sentiment_label: String (nullable)
+      - sentiment_score: Double (nullable)
+      - sentiment_inferred_at: String (nullable, ISO-8601)
+      - sentiment_error: String (nullable, error message if present)
+    """
+    return StructType(
+        [
+            StructField("url_hash", StringType(), False),
+            StructField("sentiment_label", StringType(), True),
+            StructField("sentiment_score", DoubleType(), True),
+            StructField("sentiment_inferred_at", StringType(), True),
+            StructField("sentiment_error", StringType(), True),
+        ]
+    )
+
+
+def classification_result_schema() -> StructType:
+    """Schema for classification API responses returned from `call_classify_api_partition`.
+
+    Fields:
+      - url_hash: String (non-nullable, used as join key)
+      - category_label: String (nullable)
+      - category_score: Double (nullable)
+      - category_inferred_at: String (nullable, ISO-8601)
+      - category_error: String (nullable, error message if present)
+    """
+    return StructType(
+        [
+            StructField("url_hash", StringType(), False),
+            StructField("category_label", StringType(), True),
+            StructField("category_score", DoubleType(), True),
+            StructField("category_inferred_at", StringType(), True),
+            StructField("category_error", StringType(), True),
+        ]
+    )
+
+
+def build_text_for_inference(df) -> F.Column:
+    """Build the text_for_inference column with fallback logic and truncation.
 
     Prefers summary > title > text_prepped, normalizes whitespace, and truncates
-    to MAX_SENTIMENT_CHARS characters.
+    to MAX_INFER_CHARS characters.
     """
     raw_text = F.coalesce(F.col("summary"), F.col("title"), F.col("text_prepped"))
     normalized = F.trim(F.regexp_replace(raw_text, r"\s+", " "))
-    return F.substring(normalized, 1, MAX_SENTIMENT_CHARS)
+    return F.substring(normalized, 1, MAX_INFER_CHARS)
 
 
 def prepare_base_dataframe(batch_df) -> "DataFrame":
-    """Prepare base dataframe for sentiment enrichment.
+    """Prepare base dataframe for inference enrichment.
 
-    Selects required fields, adds text_for_sentiment column, filters nulls,
+    Selects required fields, adds text_for_inference column, filters nulls,
     and deduplicates on url_hash.
     """
     return (
@@ -134,8 +224,8 @@ def prepare_base_dataframe(batch_df) -> "DataFrame":
             "scraped_at",
             "fingerprint",
         )
-        .withColumn("text_for_sentiment", build_text_for_sentiment())
-        .filter(F.col("url_hash").isNotNull() & F.col("text_for_sentiment").isNotNull())
+        .withColumn("text_for_inference", build_text_for_inference(batch_df))
+        .filter(F.col("url_hash").isNotNull() & F.col("text_for_inference").isNotNull())
         .dropDuplicates(["url_hash", "fingerprint"])
     )
 
@@ -145,39 +235,64 @@ def call_sentiment_api(spark, base_df) -> "DataFrame":
 
     Handles batching, error handling, and joins results back on url_hash.
     """
-    rdd = base_df.select("url_hash", "text_for_sentiment").rdd.mapPartitions(
+    rdd = base_df.select("url_hash", "text_for_inference").rdd.mapPartitions(
         lambda it: call_sentiment_api_partition(
             (
                 {
                     "url_hash": r["url_hash"],
-                    "text_for_sentiment": r["text_for_sentiment"],
+                    "text_for_inference": r["text_for_inference"],
                 }
                 for r in it
             ),
             endpoint=SENTIMENT_ENDPOINT,
-            batch_size=SENTIMENT_BATCH_SIZE,
-            timeout_s=SENTIMENT_TIMEOUT_S,
+            batch_size=INFERENCE_BATCH_SIZE,
+            timeout_s=INFERENCE_TIMEOUT_S,
         )
     )
     return spark.createDataFrame(rdd, schema=sentiment_result_schema())
 
 
-def display_enriched_results(
-    enriched_df, batch_id: int, total: int, error_count: int
-) -> None:
-    """Display enriched sentiment results to console.
+def call_classification_api(spark, base_df) -> "DataFrame":
+    """Call classification API via mapPartitions and return enriched dataframe.
 
-    Shows key columns: title, url, sentiment_label, sentiment_score, error.
+    Handles batching, error handling, and joins results back on url_hash.
+    """
+    rdd = base_df.select("url_hash", "text_for_inference").rdd.mapPartitions(
+        lambda it: call_classify_api_partition(
+            (
+                {
+                    "url_hash": r["url_hash"],
+                    "text_for_inference": r["text_for_inference"],
+                }
+                for r in it
+            ),
+            endpoint=CLASSIFY_ENDPOINT,
+            batch_size=INFERENCE_BATCH_SIZE,
+            timeout_s=INFERENCE_TIMEOUT_S,
+        )
+    )
+    return spark.createDataFrame(rdd, schema=classification_result_schema())
+
+
+def display_enriched_results(
+    enriched_df, batch_id: int, total: int, sentiment_error_count: int, category_error_count: int
+) -> None:
+    """Display enriched inference results to console.
+
+    Shows key columns: title, sentiment_label, sentiment_score, category_label, category_score, errors.
     """
     print(
-        f"[enrich] batch_id={batch_id} processed={total} sentiment_errors={error_count}"
+        f"[enrich] batch_id={batch_id} processed={total} "
+        f"sentiment_errors={sentiment_error_count} category_errors={category_error_count}"
     )
     enriched_df.select(
         "title",
-        "url",
         "sentiment_label",
         "sentiment_score",
-        "error",
+        "category_label",
+        "category_score",
+        "sentiment_error",
+        "category_error",
     ).show(n=CONSOLE_ROWS, truncate=TRUNCATE_DISPLAY)
 
 
@@ -278,15 +393,22 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
     """
 
     def foreach_batch_writer(batch_df, batch_id) -> None:
-        """Enrich a microbatch with sentiment results and write to all configured sinks.
+        """Enrich a microbatch with sentiment and classification results and write to all configured sinks.
 
         Orchestrates the enrichment pipeline:
-        1. Prepares base dataframe with text_for_sentiment
-        2. Calls sentiment API via mapPartitions
-        3. Joins sentiment results back on url_hash
-        4. Writes enriched results to all configured sinks
-        5. Displays results to console
+        1. Checks API readiness (skips batch if not ready)
+        2. Prepares base dataframe with text_for_inference
+        3. Calls sentiment API via mapPartitions
+        4. Calls classification API via mapPartitions
+        5. Joins both results back on url_hash
+        6. Writes enriched results to all configured sinks
+        7. Displays results to console
         """
+        # Microbatch-level readiness guard
+        if not is_api_ready():
+            print(f"[enrich] batch_id={batch_id} api not ready; skipping batch")
+            return
+
         try:
             spark = batch_df.sparkSession
 
@@ -301,14 +423,22 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
             # Call sentiment API and create dataframe
             sentiment_df = call_sentiment_api(spark, base)
 
-            # Join sentiment results
-            enriched = base.join(sentiment_df, on="url_hash", how="left")
+            # Call classification API and create dataframe
+            classify_df = call_classification_api(spark, base)
+
+            # Join both inference results
+            enriched = (
+                base
+                .join(sentiment_df, "url_hash", "left")
+                .join(classify_df, "url_hash", "left")
+            )
             enriched.cache()
 
             try:
                 # Collect stats
                 total = enriched.count()
-                error_count = enriched.filter(F.col("error").isNotNull()).count()
+                sentiment_error_count = enriched.filter(F.col("sentiment_error").isNotNull()).count()
+                category_error_count = enriched.filter(F.col("category_error").isNotNull()).count()
 
                 # Write to all configured sinks
                 for sink in sinks:
@@ -320,7 +450,7 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
                         )
 
                 # Display results to console
-                display_enriched_results(enriched, batch_id, total, error_count)
+                display_enriched_results(enriched, batch_id, total, sentiment_error_count, category_error_count)
             finally:
                 enriched.unpersist()
         except Exception as exc:
@@ -456,6 +586,13 @@ if __name__ == "__main__":
         write_kafka=write_kafka,
         parquet_output_dir=parquet_output_dir,
         bootstrap_servers=bootstrap_servers,
+    )
+
+    # Wait for inference API to be ready before starting stream
+    wait_for_api_ready(
+        ready_url=API_HEALTH_ENDPOINT,
+        timeout_s=API_READY_MAX_WAIT_S,
+        interval_s=API_READY_INTERVAL_S,
     )
 
     start_news_stream(

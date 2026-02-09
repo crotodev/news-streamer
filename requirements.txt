@@ -8,6 +8,7 @@ py4j==0.10.9.9
 pyspark==4.1.1
 pytokens==0.4.0
 PyYAML==6.0.3
+pytest==8.3.4
 black==26.1.0
 click==8.3.1
 kafka-python==2.3.0

@@ -66,7 +66,10 @@ def call_sentiment_api_partition(
 
         payload = {
             "items": [
-                {"id": item["url_hash"], "text": item["text_for_inference"]}
+                {
+                    "url_hash": item["url_hash"],
+                    "text": item["text_for_inference"],
+                }
                 for item in valid_items
             ]
         }
@@ -78,9 +81,9 @@ def call_sentiment_api_partition(
             body = response.json()
             results = body.get("results", []) if isinstance(body, dict) else []
             results_by_id = {
-                entry.get("id"): entry
+                entry.get("url_hash"): entry
                 for entry in results
-                if isinstance(entry, dict) and entry.get("id") is not None
+                if isinstance(entry, dict) and entry.get("url_hash") is not None
             }
 
             for item in valid_items:
@@ -88,8 +91,8 @@ def call_sentiment_api_partition(
                 if result:
                     yield Row(
                         url_hash=item["url_hash"],
-                        sentiment_label=result.get("label"),
-                        sentiment_score=result.get("score"),
+                        sentiment_label=result.get("sentiment_label"),
+                        sentiment_score=result.get("sentiment_score"),
                         sentiment_inferred_at=inferred_at,
                         sentiment_error=None,
                     )
@@ -171,7 +174,10 @@ def call_classify_api_partition(
 
         payload = {
             "items": [
-                {"id": item["url_hash"], "text": item["text_for_inference"]}
+                {
+                    "url_hash": item["url_hash"],
+                    "text": item["text_for_inference"],
+                }
                 for item in valid_items
             ]
         }
@@ -183,9 +189,9 @@ def call_classify_api_partition(
             body = response.json()
             results = body.get("results", []) if isinstance(body, dict) else []
             results_by_id = {
-                entry.get("id"): entry
+                entry.get("url_hash"): entry
                 for entry in results
-                if isinstance(entry, dict) and entry.get("id") is not None
+                if isinstance(entry, dict) and entry.get("url_hash") is not None
             }
 
             for item in valid_items:
@@ -193,8 +199,8 @@ def call_classify_api_partition(
                 if result:
                     yield Row(
                         url_hash=item["url_hash"],
-                        category_label=result.get("label"),
-                        category_score=result.get("score"),
+                        category_label=result.get("topic_label"),
+                        category_score=result.get("topic_score"),
                         category_inferred_at=inferred_at,
                         category_error=None,
                     )

@@ -78,8 +78,12 @@ class KafkaSink:
                     "fingerprint",
                     "sentiment_label",
                     "sentiment_score",
-                    "inferred_at",
-                    "error",
+                    "sentiment_inferred_at",
+                    "sentiment_error",
+                    "category_label",
+                    "category_score",
+                    "category_inferred_at",
+                    "category_error",
                 )
             ).alias("value")
         )

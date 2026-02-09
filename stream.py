@@ -51,7 +51,7 @@ SENTIMENT_ENDPOINT = os.environ.get(
     "SENTIMENT_ENDPOINT", f"{API_BASE_URL}/api/sentiment/batch"
 )
 CLASSIFY_ENDPOINT = os.environ.get(
-    "CLASSIFY_ENDPOINT", f"{API_BASE_URL}/api/classify/batch"
+    "CLASSIFY_ENDPOINT", f"{API_BASE_URL}/api/topic/batch"
 )
 API_HEALTH_ENDPOINT = os.environ.get("API_HEALTH_ENDPOINT", f"{API_BASE_URL}/health")
 

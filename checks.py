@@ -1,10 +1,13 @@
 """Health checks for Kafka and Java dependencies."""
 
+import logging
 import os
 import re
 import socket
 import subprocess
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def check_kafka_broker(bootstrap_servers: str, timeout: int = 5) -> bool:
@@ -24,19 +27,19 @@ def check_kafka_broker(bootstrap_servers: str, timeout: int = 5) -> bool:
         host, port = server.rsplit(":", 1) if ":" in server else (server, "9092")
 
         try:
-            print(f"Pinging Kafka broker at {server}...", end="", flush=True)
+            logger.info("Pinging Kafka broker server=%s", server)
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
             result = sock.connect_ex((host, int(port)))
             sock.close()
 
             if result == 0:
-                print(" ✓ OK")
+                logger.info("Kafka broker reachable server=%s", server)
                 return True
             else:
-                print(" ✗ Connection failed")
-        except Exception as e:
-            print(f" ✗ Error: {e}")
+                logger.warning("Kafka broker connection failed server=%s", server)
+        except Exception:
+            logger.exception("Kafka broker check failed server=%s", server)
 
     return False
 
@@ -54,7 +57,7 @@ def check_kafka_topic(bootstrap_servers: str, topic: str = "raw_news") -> bool:
     try:
         from kafka import KafkaConsumer
 
-        print(f"Checking if topic '{topic}' exists...", end="", flush=True)
+        logger.info("Checking Kafka topic existence topic=%s", topic)
 
         servers = [s.strip() for s in bootstrap_servers.split(",")]
         consumer = KafkaConsumer(
@@ -67,19 +70,22 @@ def check_kafka_topic(bootstrap_servers: str, topic: str = "raw_news") -> bool:
         consumer.close()
 
         if topic in topics:
-            print(f" ✓ Found")
+            logger.info("Kafka topic found topic=%s", topic)
             return True
         else:
-            print(f" ✗ Not found")
-            print(f"Available topics: {sorted(topics) if topics else 'None'}")
+            logger.warning("Kafka topic not found topic=%s", topic)
+            logger.info(
+                "Kafka topics available topics=%s",
+                sorted(topics) if topics else "None",
+            )
             return False
 
     except ImportError:
-        print(" ? Skipped (kafka-python not installed)")
-        print("Install with: pip install kafka-python")
+        logger.warning("Kafka topic check skipped; kafka-python not installed")
+        logger.info("Install with: pip install kafka-python")
         return True  # Don't fail if kafka-python not available
-    except Exception as e:
-        print(f" ? Skipped ({e})")
+    except Exception:
+        logger.exception("Kafka topic check skipped due to error")
         return True  # Don't fail on other errors
 
 
@@ -100,10 +106,11 @@ def ensure_kafka_topic(
         from kafka.admin import NewTopic
         from kafka.errors import TopicAlreadyExistsError
 
-        print(
-            f"Creating topic '{topic}' with partitions={num_partitions}, replication={replication_factor}...",
-            end="",
-            flush=True,
+        logger.info(
+            "Creating Kafka topic topic=%s partitions=%s replication=%s",
+            topic,
+            num_partitions,
+            replication_factor,
         )
         admin = KafkaAdminClient(
             bootstrap_servers=[s.strip() for s in bootstrap_servers.split(",")],
@@ -120,19 +127,19 @@ def ensure_kafka_topic(
                 ],
                 validate_only=False,
             )
-            print(" ✓ Created")
+            logger.info("Kafka topic created topic=%s", topic)
             return True
         except TopicAlreadyExistsError:
-            print(" ✓ Already exists")
+            logger.info("Kafka topic already exists topic=%s", topic)
             return True
         finally:
             admin.close()
     except ImportError:
-        print(" ? Skipped (kafka-python not installed)")
-        print("Install with: pip install kafka-python")
+        logger.warning("Kafka topic creation skipped; kafka-python not installed")
+        logger.info("Install with: pip install kafka-python")
         return True
-    except Exception as e:
-        print(f" ✗ Failed to create topic '{topic}': {e}")
+    except Exception:
+        logger.exception("Kafka topic creation failed topic=%s", topic)
         return False
 
 
@@ -145,12 +152,12 @@ def check_java_version() -> None:
     java_home = os.environ.get("JAVA_HOME")
 
     if not java_home:
-        print("ERROR: JAVA_HOME is not set.")
-        print("\nPySpark 4.1.1 requires Java 17.")
-        print("\nOn macOS, set JAVA_HOME with:")
-        print("  export JAVA_HOME=$(/usr/libexec/java_home -v 17)")
-        print("\nOr install Java 17:")
-        print("  brew install --cask temurin17")
+        logger.error("JAVA_HOME is not set.")
+        logger.error("PySpark 4.1.1 requires Java 17.")
+        logger.info("On macOS, set JAVA_HOME with:")
+        logger.info("  export JAVA_HOME=$(/usr/libexec/java_home -v 17)")
+        logger.info("Or install Java 17:")
+        logger.info("  brew install --cask temurin17")
         sys.exit(1)
 
     try:
@@ -171,26 +178,29 @@ def check_java_version() -> None:
                         major_version = int(match.group(1))
 
                         if major_version != 17:
-                            print(
-                                f"ERROR: Java {major_version} detected, but Java 17 is required."
+                            logger.error(
+                                "Java %s detected, but Java 17 is required.",
+                                major_version,
                             )
-                            print(f"\nCurrent JAVA_HOME: {java_home}")
-                            print("\nPySpark 4.1.1 is compatible with Java 17.")
-                            print("\nOn macOS, set JAVA_HOME to Java 17:")
-                            print("  export JAVA_HOME=$(/usr/libexec/java_home -v 17)")
+                            logger.error("Current JAVA_HOME: %s", java_home)
+                            logger.info("PySpark 4.1.1 is compatible with Java 17.")
+                            logger.info("On macOS, set JAVA_HOME to Java 17:")
+                            logger.info(
+                                "  export JAVA_HOME=$(/usr/libexec/java_home -v 17)"
+                            )
                             sys.exit(1)
 
-                        print(f"✓ Java 17 detected (JAVA_HOME: {java_home})")
+                        logger.info("Java 17 detected JAVA_HOME=%s", java_home)
                         return
 
-        print("WARNING: Could not determine Java version.")
-        print(f"JAVA_HOME is set to: {java_home}")
+        logger.warning("Could not determine Java version.")
+        logger.info("JAVA_HOME is set to: %s", java_home)
 
     except FileNotFoundError:
-        print("ERROR: Java executable not found.")
-        print(f"JAVA_HOME is set to: {java_home}")
-        print("\nPlease install Java 17 and ensure it's in your PATH.")
+        logger.error("Java executable not found.")
+        logger.error("JAVA_HOME is set to: %s", java_home)
+        logger.info("Please install Java 17 and ensure it's in your PATH.")
         sys.exit(1)
-    except Exception as e:
-        print(f"WARNING: Could not verify Java version: {e}")
-        print(f"JAVA_HOME is set to: {java_home}")
+    except Exception:
+        logger.exception("Could not verify Java version.")
+        logger.info("JAVA_HOME is set to: %s", java_home)

@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import time
 from typing import Callable, List, Optional
@@ -18,7 +19,10 @@ from pyspark.sql.types import (
 
 from api_client import call_classify_api_partition, call_sentiment_api_partition
 from checks import check_java_version, ensure_kafka_topic
+from logging_setup import configure_logging
 from sinks import KafkaSink, ParquetSink, Sink
+
+logger = logging.getLogger(__name__)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -94,18 +98,25 @@ def wait_for_api_ready(
     Raises:
         RuntimeError: If the API is not ready within the timeout period.
     """
+    logger.info(
+        "Waiting for inference API readiness url=%s timeout_s=%s interval_s=%s",
+        ready_url,
+        timeout_s,
+        interval_s,
+    )
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        print(f"[api] waiting for readiness: {ready_url} ...")
+        logger.debug("API readiness check url=%s", ready_url)
         try:
             response = requests.get(ready_url, timeout=API_READY_TIMEOUT_S)
             if response.status_code in (200, 204):
-                print(f"[api] API is ready at {ready_url}")
+                logger.info("Inference API ready url=%s", ready_url)
                 return
         except requests.exceptions.RequestException:
             pass  # Connection error, keep retrying
         time.sleep(interval_s)
 
+    logger.error("Inference API not ready url=%s timeout_s=%s", ready_url, timeout_s)
     raise RuntimeError(f"Inference API not ready after {timeout_s}s. URL: {ready_url}")
 
 
@@ -285,9 +296,12 @@ def display_enriched_results(
 
     Shows key columns: title, sentiment_label, sentiment_score, category_label, category_score, errors.
     """
-    print(
-        f"[enrich] batch_id={batch_id} processed={total} "
-        f"sentiment_errors={sentiment_error_count} category_errors={category_error_count}"
+    logger.info(
+        "enrich batch_id=%s processed=%s sentiment_errors=%s category_errors=%s",
+        batch_id,
+        total,
+        sentiment_error_count,
+        category_error_count,
     )
     enriched_df.select(
         "title",
@@ -347,6 +361,13 @@ def start_news_stream(
         "org.apache.kafka:kafka-clients:3.7.1"
     )
 
+    logger.info(
+        "Starting stream topic=%s starting_offsets=%s checkpoint_location=%s",
+        kafka_topic,
+        starting_offsets,
+        checkpoint_location,
+    )
+
     spark = (
         SparkSession.builder.appName("raw-news-stream")
         .config("spark.jars.packages", kafka_packages)
@@ -383,6 +404,8 @@ def start_news_stream(
         .start()
     )
 
+    logger.info("Stream query started")
+
     sentiment_query.awaitTermination()
 
 
@@ -410,7 +433,9 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
         """
         # Microbatch-level readiness guard
         if not is_api_ready():
-            print(f"[enrich] batch_id={batch_id} api not ready; skipping batch")
+            logger.warning(
+                "enrich batch_id=%s api_not_ready=true; skipping batch", batch_id
+            )
             return
 
         try:
@@ -421,7 +446,10 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
 
             count_after_filter = base.count()
             if count_after_filter == 0:
-                print(f"[enrich] batch_id={batch_id} empty after filter; skipping")
+                logger.info(
+                    "enrich batch_id=%s empty_after_filter=true; skipping batch",
+                    batch_id,
+                )
                 return
 
             # Call sentiment API and create dataframe
@@ -450,9 +478,12 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
                 for sink in sinks:
                     try:
                         sink.write(enriched, batch_id)
-                    except Exception as sink_exc:
-                        print(
-                            f"[enrich] batch_id={batch_id} sink {type(sink).__name__} failed: {sink_exc}"
+                    except Exception:
+                        logger.error(
+                            "enrich batch_id=%s sink=%s failed",
+                            batch_id,
+                            type(sink).__name__,
+                            exc_info=True,
                         )
 
                 # Display results to console
@@ -465,8 +496,8 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
                 )
             finally:
                 enriched.unpersist()
-        except Exception as exc:
-            print(f"[enrich] batch_id={batch_id} failed: {exc}")
+        except Exception:
+            logger.exception("enrich batch_id=%s failed", batch_id)
 
     return foreach_batch_writer
 
@@ -485,6 +516,8 @@ def load_config(config_path: str) -> dict:
 
 
 if __name__ == "__main__":
+    configure_logging()
+
     # Check Java version before proceeding
     check_java_version()
 
@@ -598,6 +631,13 @@ if __name__ == "__main__":
         write_kafka=write_kafka,
         parquet_output_dir=parquet_output_dir,
         bootstrap_servers=bootstrap_servers,
+    )
+
+    logger.info(
+        "Configured sinks write_parquet=%s write_kafka=%s sink_count=%s",
+        write_parquet,
+        write_kafka,
+        len(sinks),
     )
 
     # Wait for inference API to be ready before starting stream

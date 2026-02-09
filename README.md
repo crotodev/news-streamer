@@ -64,6 +64,14 @@ spark:
   app_name: "raw-news-stream"
 ```
 
+### Logging
+
+Control log verbosity with the `LOG_LEVEL` environment variable (default: `INFO`).
+
+```bash
+LOG_LEVEL=DEBUG JAVA_HOME=$(/usr/libexec/java_home -v 17) python stream.py
+```
+
 ### Using Command-Line Arguments
 
 All configuration options can be overridden via command-line arguments:

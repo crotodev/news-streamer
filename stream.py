@@ -1,22 +1,24 @@
 import argparse
 import os
 import time
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import requests
 import yaml
-from pyspark.sql import SparkSession, functions as F
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.types import (
     DoubleType,
+    StringType,
     StructField,
     StructType,
-    StringType,
     TimestampType,
 )
 
+from api_client import call_classify_api_partition, call_sentiment_api_partition
 from checks import check_java_version, ensure_kafka_topic
-from api_client import call_sentiment_api_partition, call_classify_api_partition
-from sinks import Sink, ParquetSink, KafkaSink
+from sinks import KafkaSink, ParquetSink, Sink
 
 
 def _env_int(name: str, default: int) -> int:
@@ -51,9 +53,7 @@ SENTIMENT_ENDPOINT = os.environ.get(
 CLASSIFY_ENDPOINT = os.environ.get(
     "CLASSIFY_ENDPOINT", f"{API_BASE_URL}/api/classify/batch"
 )
-API_HEALTH_ENDPOINT = os.environ.get(
-    "API_HEALTH_ENDPOINT", f"{API_BASE_URL}/health"
-)
+API_HEALTH_ENDPOINT = os.environ.get("API_HEALTH_ENDPOINT", f"{API_BASE_URL}/health")
 
 # Inference API Configuration
 INFERENCE_BATCH_SIZE = _env_int("INFERENCE_BATCH_SIZE", 25)
@@ -63,7 +63,9 @@ MAX_INFER_CHARS = _env_int("MAX_INFER_CHARS", 2000)
 # API Readiness Configuration
 API_READY_MAX_WAIT_S = _env_int("API_READY_MAX_WAIT_S", 60)
 API_READY_INTERVAL_S = _env_int("API_READY_INTERVAL_S", 2)
-API_READY_TIMEOUT_S = _env_int("API_READY_TIMEOUT_S", 2)  # Per-request timeout for readiness check
+API_READY_TIMEOUT_S = _env_int(
+    "API_READY_TIMEOUT_S", 2
+)  # Per-request timeout for readiness check
 
 # Output Configuration
 CONSOLE_ROWS = 50
@@ -104,9 +106,7 @@ def wait_for_api_ready(
             pass  # Connection error, keep retrying
         time.sleep(interval_s)
 
-    raise RuntimeError(
-        f"Inference API not ready after {timeout_s}s. URL: {ready_url}"
-    )
+    raise RuntimeError(f"Inference API not ready after {timeout_s}s. URL: {ready_url}")
 
 
 def is_api_ready(ready_url: str = API_HEALTH_ENDPOINT) -> bool:
@@ -204,7 +204,7 @@ def build_text_for_inference(df) -> F.Column:
     return F.substring(normalized, 1, MAX_INFER_CHARS)
 
 
-def prepare_base_dataframe(batch_df) -> "DataFrame":
+def prepare_base_dataframe(batch_df) -> DataFrame:
     """Prepare base dataframe for inference enrichment.
 
     Selects required fields, adds text_for_inference column, filters nulls,
@@ -275,7 +275,11 @@ def call_classification_api(spark, base_df) -> "DataFrame":
 
 
 def display_enriched_results(
-    enriched_df, batch_id: int, total: int, sentiment_error_count: int, category_error_count: int
+    enriched_df,
+    batch_id: int,
+    total: int,
+    sentiment_error_count: int,
+    category_error_count: int,
 ) -> None:
     """Display enriched inference results to console.
 
@@ -300,7 +304,7 @@ def build_sinks_from_config(
     write_parquet: bool,
     write_kafka: bool,
     parquet_output_dir: str,
-    bootstrap_servers: str = None,
+    bootstrap_servers: Optional[str] = None,
 ) -> List[Sink]:
     """Build a list of sinks from legacy configuration flags.
 
@@ -427,18 +431,20 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
             classify_df = call_classification_api(spark, base)
 
             # Join both inference results
-            enriched = (
-                base
-                .join(sentiment_df, "url_hash", "left")
-                .join(classify_df, "url_hash", "left")
+            enriched = base.join(sentiment_df, "url_hash", "left").join(
+                classify_df, "url_hash", "left"
             )
             enriched.cache()
 
             try:
                 # Collect stats
                 total = enriched.count()
-                sentiment_error_count = enriched.filter(F.col("sentiment_error").isNotNull()).count()
-                category_error_count = enriched.filter(F.col("category_error").isNotNull()).count()
+                sentiment_error_count = enriched.filter(
+                    F.col("sentiment_error").isNotNull()
+                ).count()
+                category_error_count = enriched.filter(
+                    F.col("category_error").isNotNull()
+                ).count()
 
                 # Write to all configured sinks
                 for sink in sinks:
@@ -450,7 +456,13 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
                         )
 
                 # Display results to console
-                display_enriched_results(enriched, batch_id, total, sentiment_error_count, category_error_count)
+                display_enriched_results(
+                    enriched,
+                    batch_id,
+                    total,
+                    sentiment_error_count,
+                    category_error_count,
+                )
             finally:
                 enriched.unpersist()
         except Exception as exc:

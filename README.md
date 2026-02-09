@@ -201,7 +201,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 
 **Problem**: `UnknownTopicOrPartitionException`
 
-**Solution**: 
+**Solution**:
 - Verify Kafka is running: `kafka-topics --bootstrap-server localhost:9092 --list`
 - Check the topic exists: Ensure `raw_news` topic is created; `enriched_news` is auto-created at startup
 - Verify bootstrap servers in config match your Kafka setup

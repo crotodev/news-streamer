@@ -429,8 +429,12 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
         """
         # Microbatch-level readiness guard
         if not is_api_ready():
-            print(f"[enrich] batch_id={batch_id} api not ready; skipping batch")
-            return
+            print(f"[enrich] batch_id={batch_id} api not ready; waiting for it")
+            wait_for_api_ready(
+                ready_url=API_HEALTH_ENDPOINT,
+                timeout_s=API_READY_MAX_WAIT_S,
+                interval_s=API_READY_INTERVAL_S,
+            )
 
         try:
             spark = batch_df.sparkSession
@@ -486,6 +490,7 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
                 enriched.unpersist()
         except Exception as exc:
             print(f"[enrich] batch_id={batch_id} failed: {exc}")
+            raise
 
     return foreach_batch_writer
 

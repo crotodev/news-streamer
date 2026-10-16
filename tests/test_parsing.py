@@ -33,6 +33,8 @@ def test_parse_raw_news_converts_iso_timestamps(spark) -> None:
     assert row.published_at is not None
     assert row.published_at.isoformat().startswith("2026-10-16T12:30:00")
     assert row.text_prepped == "Body text here"
+    assert row.scraped_at is not None
+    assert row.scraped_at.microsecond == 123456
 
 
 def test_parse_raw_news_empty_published_at_becomes_null(spark) -> None:

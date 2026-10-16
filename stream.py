@@ -13,7 +13,6 @@ from pyspark.sql.types import (
     StringType,
     StructField,
     StructType,
-    TimestampType,
 )
 
 from api_client import call_classify_api_partition, call_sentiment_api_partition
@@ -132,7 +131,7 @@ def news_item_schema() -> StructType:
 
     Fields:
       - title, author, text, summary, url, source, url_hash, fingerprint: String
-      - published_at, scraped_at: Timestamp (nullable; expect ISO-8601 strings)
+      - published_at, scraped_at: String (ISO-8601; converted in parse_raw_news)
     """
 
     return StructType(
@@ -143,8 +142,8 @@ def news_item_schema() -> StructType:
             StructField("summary", StringType(), True),
             StructField("url", StringType(), True),
             StructField("source", StringType(), True),
-            StructField("published_at", TimestampType(), True),
-            StructField("scraped_at", TimestampType(), True),
+            StructField("published_at", StringType(), True),
+            StructField("scraped_at", StringType(), True),
             StructField("url_hash", StringType(), True),
             StructField("fingerprint", StringType(), True),
         ]
@@ -193,13 +192,21 @@ def classification_result_schema() -> StructType:
     )
 
 
-def build_text_for_inference(df) -> F.Column:
+def _non_blank(col_name: str) -> F.Column:
+    """Return the column value, or null if it is null/blank."""
+    column = F.col(col_name)
+    return F.when(F.trim(column) != "", column)
+
+
+def build_text_for_inference() -> F.Column:
     """Build the text_for_inference column with fallback logic and truncation.
 
-    Prefers summary > title > text_prepped, normalizes whitespace, and truncates
-    to MAX_INFER_CHARS characters.
+    Prefers summary > title > text_prepped (skipping blank values), normalizes
+    whitespace, and truncates to MAX_INFER_CHARS characters.
     """
-    raw_text = F.coalesce(F.col("summary"), F.col("title"), F.col("text_prepped"))
+    raw_text = F.coalesce(
+        _non_blank("summary"), _non_blank("title"), _non_blank("text_prepped")
+    )
     normalized = F.trim(F.regexp_replace(raw_text, r"\s+", " "))
     return F.substring(normalized, 1, MAX_INFER_CHARS)
 
@@ -224,7 +231,7 @@ def prepare_base_dataframe(batch_df) -> DataFrame:
             "scraped_at",
             "fingerprint",
         )
-        .withColumn("text_for_inference", build_text_for_inference(batch_df))
+        .withColumn("text_for_inference", build_text_for_inference())
         .filter(F.col("url_hash").isNotNull() & F.col("text_for_inference").isNotNull())
         .dropDuplicates(["url_hash", "fingerprint"])
     )
@@ -325,6 +332,24 @@ def build_sinks_from_config(
     return sinks
 
 
+def parse_raw_news(kafka_df: DataFrame) -> DataFrame:
+    """Parse Kafka `value` JSON into NewsItem columns plus `text_prepped`.
+
+    Timestamps arrive as ISO-8601 strings (possibly empty) and are converted
+    with try_to_timestamp so bad values become null instead of failing.
+    """
+    return (
+        kafka_df.select(F.col("value").cast("string").alias("json"))
+        .select(F.from_json(F.col("json"), news_item_schema()).alias("news"))
+        .select("news.*")
+        .withColumn("published_at", F.try_to_timestamp(F.col("published_at")))
+        .withColumn("scraped_at", F.try_to_timestamp(F.col("scraped_at")))
+        .withColumn(
+            "text_prepped", F.regexp_replace(F.trim(F.col("text")), r"\s+", " ")
+        )
+    )
+
+
 def start_news_stream(
     bootstrap_servers: str,
     checkpoint_location: str,
@@ -351,6 +376,7 @@ def start_news_stream(
         SparkSession.builder.appName("raw-news-stream")
         .config("spark.jars.packages", kafka_packages)
         .config("spark.sql.streaming.schemaInference", False)
+        .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
 
@@ -366,14 +392,7 @@ def start_news_stream(
         .load()
     )
 
-    parsed_df = (
-        kafka_df.select(F.col("value").cast("string").alias("json"))
-        .select(F.from_json(F.col("json"), news_item_schema()).alias("news"))
-        .select("news.*")
-        .withColumn(
-            "text_prepped", F.regexp_replace(F.trim(F.col("text")), r"\s+", " ")
-        )
-    )
+    parsed_df = parse_raw_news(kafka_df)
 
     # Sentiment enrichment and writing via foreachBatch with custom sinks
     sentiment_query = (

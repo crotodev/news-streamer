@@ -51,9 +51,9 @@ SENTIMENT_ENDPOINT = os.environ.get(
     "SENTIMENT_ENDPOINT", f"{API_BASE_URL}/api/sentiment/batch"
 )
 CLASSIFY_ENDPOINT = os.environ.get(
-    "CLASSIFY_ENDPOINT", f"{API_BASE_URL}/api/classify/batch"
+    "CLASSIFY_ENDPOINT", f"{API_BASE_URL}/api/topic/batch"
 )
-API_HEALTH_ENDPOINT = os.environ.get("API_HEALTH_ENDPOINT", f"{API_BASE_URL}/health")
+API_HEALTH_ENDPOINT = os.environ.get("API_HEALTH_ENDPOINT", f"{API_BASE_URL}/ready")
 
 # Inference API Configuration
 INFERENCE_BATCH_SIZE = _env_int("INFERENCE_BATCH_SIZE", 25)

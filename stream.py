@@ -17,6 +17,7 @@ from pyspark.sql.types import (
 
 from api_client import call_classify_api_partition, call_sentiment_api_partition
 from checks import check_java_version, ensure_kafka_topic
+from ollama_client import call_ollama_analysis_partition
 from sinks import KafkaSink, ParquetSink, Sink
 
 
@@ -339,6 +340,16 @@ def call_classification_api(spark, base_df) -> "DataFrame":
     return spark.createDataFrame(rdd, schema=classification_result_schema())
 
 
+def call_ollama_analysis(spark, base_df, settings: dict) -> DataFrame:
+    """Analyze complete article text independently in each Spark partition."""
+    partition_client = call_ollama_analysis_partition
+    client_settings = {key: value for key, value in settings.items() if key != "enabled"}
+    rdd = base_df.select("url_hash", "text_for_llm").rdd.mapPartitions(
+        lambda rows: partition_client((row.asDict() for row in rows), **client_settings)
+    )
+    return spark.createDataFrame(rdd, schema=llm_result_schema())
+
+
 def display_enriched_results(
     enriched_df,
     batch_id: int,
@@ -414,6 +425,7 @@ def start_news_stream(
     sinks: List[Sink],
     starting_offsets: str = "latest",
     kafka_topic: str = "raw_news",
+    ollama_settings: Optional[dict] = None,
 ) -> None:
     """Start a Structured Streaming query consuming `raw_news` and parsing with `news_item_schema`.
 
@@ -421,9 +433,12 @@ def start_news_stream(
         bootstrap_servers: Kafka bootstrap servers, e.g. "localhost:9092" or "host1:9092,host2:9092".
         checkpoint_location: Filesystem path for Spark checkpoints.
         sinks: List of Sink objects to write enriched data to.
+        ollama_settings: Resolved optional Ollama settings; defaults to environment values.
         starting_offsets: Kafka starting offsets ("earliest" or "latest"). Defaults to "latest".
         kafka_topic: Kafka topic name to subscribe to. Defaults to "raw_news".
     """
+
+    batch_writer = make_foreach_batch_writer(sinks, ollama_settings=ollama_settings)
 
     kafka_packages = (
         "org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.1,"
@@ -456,22 +471,31 @@ def start_news_stream(
     sentiment_query = (
         parsed_df.writeStream.option("checkpointLocation", checkpoint_location)
         .outputMode("append")
-        .foreachBatch(make_foreach_batch_writer(sinks=sinks))
+        .foreachBatch(batch_writer)
         .start()
     )
 
     sentiment_query.awaitTermination()
 
 
-def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
+def make_foreach_batch_writer(
+    sinks: List[Sink], ollama_settings: Optional[dict] = None
+) -> Callable[..., None]:
     """Factory function that returns a foreachBatch writer function.
 
     Args:
         sinks: List of Sink objects to write enriched data to.
+        ollama_settings: Resolved optional Ollama settings; defaults to environment values.
 
     Returns:
         A function (batch_df, batch_id) -> None that enriches and writes to all configured sinks.
     """
+
+    settings = (
+        dict(ollama_settings) if ollama_settings is not None else load_ollama_settings()
+    )
+    if settings.get("enabled") and not str(settings.get("model") or "").strip():
+        raise ValueError("OLLAMA_MODEL is required when Ollama analysis is enabled")
 
     def foreach_batch_writer(batch_df, batch_id) -> None:
         """Enrich a microbatch with sentiment and classification results and write to all configured sinks.
@@ -481,7 +505,7 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
         2. Prepares base dataframe with text_for_inference
         3. Calls sentiment API via mapPartitions
         4. Calls classification API via mapPartitions
-        5. Joins both results back on url_hash
+        5. Joins ONNX and optional full-article Ollama results on url_hash
         6. Writes enriched results to all configured sinks
         7. Displays results to console
         """
@@ -515,6 +539,15 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
             enriched = base.join(sentiment_df, "url_hash", "left").join(
                 classify_df, "url_hash", "left"
             )
+            if settings.get("enabled"):
+                llm_df = call_ollama_analysis(spark, base, settings)
+                enriched = enriched.join(llm_df, "url_hash", "left")
+            else:
+                for field in llm_result_schema().fields:
+                    if field.name != "url_hash":
+                        enriched = enriched.withColumn(
+                            field.name, F.lit(None).cast(field.dataType)
+                        )
             enriched.cache()
 
             try:
@@ -526,6 +559,9 @@ def make_foreach_batch_writer(sinks: List[Sink]) -> Callable[..., None]:
                 category_error_count = enriched.filter(
                     F.col("category_error").isNotNull()
                 ).count()
+
+                llm_error_count = enriched.filter(F.col("llm_error").isNotNull()).count()
+                print(f"[enrich] batch_id={batch_id} llm_errors={llm_error_count}")
 
                 # Write to all configured sinks
                 for sink in sinks:
@@ -682,6 +718,10 @@ if __name__ == "__main__":
         bootstrap_servers=bootstrap_servers,
     )
 
+    ollama_settings = load_ollama_settings(config)
+    if ollama_settings["enabled"] and not ollama_settings["model"]:
+        raise ValueError("OLLAMA_MODEL is required when Ollama analysis is enabled")
+
     # Wait for inference API to be ready before starting stream
     wait_for_api_ready(
         ready_url=API_HEALTH_ENDPOINT,
@@ -695,4 +735,5 @@ if __name__ == "__main__":
         sinks=sinks,
         starting_offsets=starting_offsets,
         kafka_topic=kafka_topic,
+        ollama_settings=ollama_settings,
     )

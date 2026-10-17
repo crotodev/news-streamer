@@ -28,6 +28,10 @@ ENRICHED_KAFKA_COLUMNS = (
     "category_score",
     "category_inferred_at",
     "category_error",
+    "llm_analysis",
+    "llm_model",
+    "llm_inferred_at",
+    "llm_error",
 )
 
 

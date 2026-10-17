@@ -10,10 +10,12 @@ spark:
   checkpoint_location: "/tmp/raw_news_checkpoints"
   app_name: "raw-news-stream"
 
+# Optional full-article analysis. OLLAMA_* environment variables override these values.
+# In root Docker Compose, the default base URL is http://host.docker.internal:11434.
 ollama:
   enabled: false
   base_url: "http://localhost:11434"
-  model: null
+  model: null  # Required when enabled; use a model already pulled into Ollama
   timeout_s: 180
   chunk_chars: 6000
   num_ctx: 8192

@@ -37,7 +37,7 @@ source .venv/bin/activate  # On macOS/Linux
 
 3. Install dependencies:
 ```bash
-pip install pyspark pyyaml kafka-python
+pip install -r requirements.txt
 ```
 
 4. Install Java 17 (macOS with Homebrew):
@@ -66,7 +66,7 @@ spark:
 
 ### Using Command-Line Arguments
 
-All configuration options can be overridden via command-line arguments:
+Kafka and Spark settings can be overridden via command-line arguments. Ollama settings use YAML and environment variables as described below:
 
 ```bash
 python stream.py --bootstrap-servers localhost:9092 \
@@ -116,6 +116,58 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) python stream.py --starting-offsets ea
 JAVA_HOME=$(/usr/libexec/java_home -v 17) python stream.py --write-kafka
 ```
 ```
+
+## Optional full-article analysis with Ollama
+
+Ollama adds a structured analysis of the complete extracted article `text` after whitespace normalization. It uses a separate full-text column from the length-limited text sent to the ONNX sentiment and topic endpoints. Analysis is disabled by default, and disabled runs make no Ollama requests.
+
+Install and start [Ollama](https://ollama.com/download) on the host or another reachable machine. Select a model that fits your available RAM/VRAM and supports instruction following and JSON output. Replace `your-model:tag` below with that model's actual name. Download it explicitly before enabling analysis:
+
+```powershell
+ollama pull your-model:tag
+# If the Ollama desktop app/service is not already serving:
+ollama serve
+```
+
+Run `ollama serve` in a separate terminal if needed. For a streamer running directly on the host, configure the same model and enable analysis:
+
+```powershell
+$env:OLLAMA_ENABLED = "true"
+$env:OLLAMA_MODEL = "your-model:tag"
+$env:OLLAMA_BASE_URL = "http://localhost:11434"
+python stream.py
+```
+
+For the root Docker Compose deployment, the same environment variables are passed into the streamer, with a container default URL of `http://host.docker.internal:11434`. See the root README for the Compose command. Docker Desktop provides that hostname on Windows/macOS; other Docker environments need a host address reachable from the container or an appropriate host gateway mapping. A remote Ollama server can be selected with `OLLAMA_BASE_URL`.
+
+YAML values belong under `ollama` in `config.yaml`. Each corresponding environment variable takes precedence. Ollama has no command-line flags in the streamer.
+
+| Environment variable | YAML key | Host default | Purpose |
+| --- | --- | --- | --- |
+| `OLLAMA_ENABLED` | `enabled` | `false` | Enable analysis; set to `false` to opt out |
+| `OLLAMA_BASE_URL` | `base_url` | `http://localhost:11434` | Ollama server URL; Compose defaults to `http://host.docker.internal:11434` |
+| `OLLAMA_MODEL` | `model` | unset (`null`) | Exact name of a locally available model; required when enabled |
+| `OLLAMA_TIMEOUT_S` | `timeout_s` | `180` | HTTP timeout in seconds for each request |
+| `OLLAMA_CHUNK_CHARS` | `chunk_chars` | `6000` | Maximum normalized characters per article segment |
+| `OLLAMA_NUM_CTX` | `num_ctx` | `8192` | Ollama context size per request, including prompts and output |
+| `OLLAMA_KEEP_ALIVE` | `keep_alive` | `5m` | How long Ollama keeps the model loaded after a request |
+
+A missing model name stops enabled startup with a configuration error. The pipeline does not download models or start Ollama. HTTP failures, unavailable models, empty article bodies, malformed JSON, and invalid analysis fields produce per-article `llm_error` metadata while the article continues to the configured sinks. Requests are made during batch enrichment, so an unreachable server can delay a batch until the timeout.
+
+An article within the segment limit uses one request. Longer articles use one request for each segment, followed by a request that synthesizes all segment observations. Smaller segments reduce each request's input but increase request count and the size of the synthesis input. Larger context settings use more memory and must fit the selected model and machine. Analysis adds latency and CPU/GPU work; long articles may take substantially longer than ONNX predictions.
+
+There is no silent text truncation. A single whitespace-delimited token larger than `OLLAMA_CHUNK_CHARS` yields `article_token_exceeds_chunk_budget`. Every request, including final synthesis, is checked against a conservative UTF-8 byte estimate with room reserved for prompts and generated JSON. If the complete prompt or all segment observations cannot fit, the article yields `context_budget_exceeded` and no partial analysis is returned. Increasing `OLLAMA_NUM_CTX`, choosing a suitable model, or adjusting the segment size may be necessary. Character limits are not token limits, and multibyte text can reach this guard sooner.
+
+Enriched Kafka JSON and Parquet rows include:
+
+| Field | Value |
+| --- | --- |
+| `llm_analysis` | JSON string with `summary` and `sentiment` strings plus `key_points`, `entities`, and `caveats` arrays of strings |
+| `llm_model` | Configured model name for an attempted analysis |
+| `llm_inferred_at` | UTC timestamp for the analysis attempt |
+| `llm_error` | Error text on failure; null on success |
+
+All four fields are null when disabled. On failure, `llm_analysis` is null and the attempt's model, timestamp, and error remain available. To disable analysis, set `OLLAMA_ENABLED=false` (and recreate the streamer if using Compose).
 
 ## News Article Schema
 

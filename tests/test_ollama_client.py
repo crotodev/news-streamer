@@ -220,7 +220,6 @@ def test_partition_adapter_keeps_each_url_hash_and_isolates_articles():
     assert set(REQUIRED_ANALYSIS_FIELDS) == set(analysis())
 
 
-
 def test_chunking_rejects_an_oversized_token_without_splitting_it():
     with pytest.raises(ValueError, match="article_token_exceeds_chunk_budget"):
         chunk_text("prefix " + "x" * 25 + " suffix", 8)
@@ -229,9 +228,15 @@ def test_chunking_rejects_an_oversized_token_without_splitting_it():
 def test_oversized_article_token_returns_an_explicit_error_before_http():
     session = FakeSession([FakeResponse(analysis())] * 10)
     result = analyze_article(
-        "hash-token", "prefix " + "x" * 25 + " suffix",
-        base_url="http://localhost:11434", model="local", timeout_s=10,
-        chunk_chars=8, num_ctx=4096, keep_alive="5m", session=session,
+        "hash-token",
+        "prefix " + "x" * 25 + " suffix",
+        base_url="http://localhost:11434",
+        model="local",
+        timeout_s=10,
+        chunk_chars=8,
+        num_ctx=4096,
+        keep_alive="5m",
+        session=session,
     )
     assert result["llm_analysis"] is None
     assert "article_token_exceeds_chunk_budget" in result["llm_error"]
@@ -246,9 +251,15 @@ def test_oversized_synthesis_returns_error_without_sending_an_over_budget_prompt
         + [FakeResponse(analysis("must not be used"))]
     )
     result = analyze_article(
-        "hash-synthesis", text,
-        base_url="http://localhost:11434", model="local", timeout_s=10,
-        chunk_chars=10, num_ctx=4096, keep_alive="5m", session=session,
+        "hash-synthesis",
+        text,
+        base_url="http://localhost:11434",
+        model="local",
+        timeout_s=10,
+        chunk_chars=10,
+        num_ctx=4096,
+        keep_alive="5m",
+        session=session,
     )
     assert len(session.calls) == len(chunks)
     sent = [call[1]["json"]["messages"][-1]["content"] for call in session.calls]
@@ -260,10 +271,45 @@ def test_oversized_synthesis_returns_error_without_sending_an_over_budget_prompt
 def test_article_prompt_budget_counts_unicode_bytes_before_http():
     session = FakeSession([FakeResponse(analysis())])
     result = analyze_article(
-        "hash-unicode", "\u754c" * 1000,
-        base_url="http://localhost:11434", model="local", timeout_s=10,
-        chunk_chars=2000, num_ctx=2048, keep_alive="5m", session=session,
+        "hash-unicode",
+        "\u754c" * 1000,
+        base_url="http://localhost:11434",
+        model="local",
+        timeout_s=10,
+        chunk_chars=2000,
+        num_ctx=2048,
+        keep_alive="5m",
+        session=session,
     )
     assert session.calls == []
     assert result["llm_analysis"] is None
     assert "context_budget_exceeded" in result["llm_error"]
+
+
+def test_partition_adapter_preserves_article_fingerprint_on_success_and_failure():
+    session = FakeSession([FakeResponse(analysis("first")), RuntimeError("offline")])
+    rows = list(
+        call_ollama_analysis_partition(
+            [
+                {"url_hash": "same", "fingerprint": "v1", "text_for_llm": "first body"},
+                {
+                    "url_hash": "same",
+                    "fingerprint": "v2",
+                    "text_for_llm": "second body",
+                },
+                {"url_hash": "same", "fingerprint": None, "text_for_llm": None},
+            ],
+            base_url="http://localhost:11434",
+            model="local",
+            num_ctx=1024,
+            session=session,
+        )
+    )
+    assert [row.asDict().get("fingerprint", "MISSING") for row in rows] == [
+        "v1",
+        "v2",
+        None,
+    ]
+    assert rows[0].llm_analysis is not None
+    assert rows[1].llm_error == "offline"
+    assert rows[2].llm_error == "empty_article_text"

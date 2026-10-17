@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 import stream
 
 
@@ -38,9 +40,7 @@ def test_parse_raw_news_converts_iso_timestamps(spark) -> None:
 
 
 def test_parse_raw_news_empty_published_at_becomes_null(spark) -> None:
-    [row] = stream.parse_raw_news(
-        _kafka_df(spark, _item(published_at=""))
-    ).collect()
+    [row] = stream.parse_raw_news(_kafka_df(spark, _item(published_at=""))).collect()
 
     assert row.published_at is None
     assert row.title == "Headline"
@@ -48,9 +48,7 @@ def test_parse_raw_news_empty_published_at_becomes_null(spark) -> None:
 
 
 def test_parse_raw_news_null_published_at_is_null(spark) -> None:
-    [row] = stream.parse_raw_news(
-        _kafka_df(spark, _item(published_at=None))
-    ).collect()
+    [row] = stream.parse_raw_news(_kafka_df(spark, _item(published_at=None))).collect()
 
     assert row.published_at is None
 
@@ -100,7 +98,9 @@ def test_default_ollama_settings_are_disabled(monkeypatch) -> None:
     assert settings["keep_alive"] == "5m"
 
 
-def test_ollama_settings_use_yaml_defaults_and_environment_overrides(monkeypatch) -> None:
+def test_ollama_settings_use_yaml_defaults_and_environment_overrides(
+    monkeypatch,
+) -> None:
     for name in (
         "OLLAMA_ENABLED",
         "OLLAMA_BASE_URL",
@@ -161,7 +161,9 @@ def test_missing_or_blank_body_keeps_onnx_fallback_and_null_llm_text(spark) -> N
             _item(url_hash="h2", fingerprint="f2", text=" \n  ", summary="brief"),
         )
     )
-    rows = {row.url_hash: row for row in stream.prepare_base_dataframe(parsed).collect()}
+    rows = {
+        row.url_hash: row for row in stream.prepare_base_dataframe(parsed).collect()
+    }
 
     assert rows["h1"].text_for_inference == "brief"
     assert rows["h1"].text_for_llm is None
@@ -174,8 +176,38 @@ def test_llm_result_schema_has_nullable_result_fields() -> None:
 
     assert fields == {
         "url_hash": False,
+        "fingerprint": True,
         "llm_analysis": True,
         "llm_model": True,
         "llm_inferred_at": True,
         "llm_error": True,
     }
+
+
+@pytest.mark.parametrize(
+    "name", ["OLLAMA_TIMEOUT_S", "OLLAMA_CHUNK_CHARS", "OLLAMA_NUM_CTX"]
+)
+@pytest.mark.parametrize("value", ["invalid", "0", "-2"])
+def test_enabled_ollama_rejects_invalid_numeric_settings(monkeypatch, name, value):
+    monkeypatch.setenv("OLLAMA_ENABLED", "true")
+    monkeypatch.setenv("OLLAMA_MODEL", "local")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        stream.load_ollama_settings()
+
+
+def test_enabled_ollama_rejects_context_too_small_for_fixed_prompt(monkeypatch):
+    monkeypatch.setenv("OLLAMA_ENABLED", "true")
+    monkeypatch.setenv("OLLAMA_MODEL", "local")
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "256")
+    with pytest.raises(ValueError, match="OLLAMA_NUM_CTX"):
+        stream.load_ollama_settings()
+
+
+@pytest.mark.parametrize("key", ["timeout_s", "chunk_chars", "num_ctx"])
+def test_enabled_ollama_rejects_malformed_yaml_numeric_settings(monkeypatch, key):
+    monkeypatch.delenv("OLLAMA_" + key.upper(), raising=False)
+    with pytest.raises(ValueError, match="OLLAMA_" + key.upper()):
+        stream.load_ollama_settings(
+            {"ollama": {"enabled": True, "model": "local", key: "bad"}}
+        )

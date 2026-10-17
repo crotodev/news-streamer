@@ -17,7 +17,7 @@ from pyspark.sql.types import (
 
 from api_client import call_classify_api_partition, call_sentiment_api_partition
 from checks import check_java_version, ensure_kafka_topic
-from ollama_client import call_ollama_analysis_partition
+from ollama_client import call_ollama_analysis_partition, validate_context_capacity
 from sinks import KafkaSink, ParquetSink, Sink
 
 
@@ -45,15 +45,30 @@ def _coerce_bool(value, default: bool) -> bool:
     return default
 
 
-def _env_int_or_config(name: str, config_value, default: int) -> int:
-    """Resolve an integer setting with environment values taking precedence."""
-    value = os.environ.get(name)
-    if value is None:
-        value = config_value
-    try:
-        return int(value) if value is not None else default
-    except (TypeError, ValueError):
-        return default
+def validate_ollama_settings(settings: dict) -> dict:
+    """Normalize limits and reject invalid enabled configurations before startup."""
+    resolved = dict(settings)
+    enabled = _coerce_bool(resolved.get("enabled"), False)
+    resolved["enabled"] = enabled
+    if enabled and not str(resolved.get("model") or "").strip():
+        raise ValueError("OLLAMA_MODEL is required when Ollama analysis is enabled")
+    for key, default in (("timeout_s", 180), ("chunk_chars", 6000), ("num_ctx", 8192)):
+        name = "OLLAMA_" + key.upper()
+        value = resolved.get(key, default)
+        try:
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                raise ValueError()
+            value = int(value)
+        except (TypeError, ValueError):
+            if enabled:
+                raise ValueError(f"{name} must be a positive integer") from None
+            value = default
+        if enabled and value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        resolved[key] = value
+    if enabled:
+        validate_context_capacity(resolved["num_ctx"])
+    return resolved
 
 
 def load_ollama_settings(config: Optional[dict] = None) -> dict:
@@ -66,21 +81,19 @@ def load_ollama_settings(config: Optional[dict] = None) -> dict:
     model = resolve("OLLAMA_MODEL", "model", None)
     if model is not None and not str(model).strip():
         model = None
-    return {
-        "enabled": _coerce_bool(resolve("OLLAMA_ENABLED", "enabled", False), False),
-        "base_url": resolve("OLLAMA_BASE_URL", "base_url", "http://localhost:11434"),
-        "model": model,
-        "timeout_s": _env_int_or_config(
-            "OLLAMA_TIMEOUT_S", configured.get("timeout_s"), 180
-        ),
-        "chunk_chars": _env_int_or_config(
-            "OLLAMA_CHUNK_CHARS", configured.get("chunk_chars"), 6000
-        ),
-        "num_ctx": _env_int_or_config(
-            "OLLAMA_NUM_CTX", configured.get("num_ctx"), 8192
-        ),
-        "keep_alive": resolve("OLLAMA_KEEP_ALIVE", "keep_alive", "5m"),
-    }
+    return validate_ollama_settings(
+        {
+            "enabled": _coerce_bool(resolve("OLLAMA_ENABLED", "enabled", False), False),
+            "base_url": resolve(
+                "OLLAMA_BASE_URL", "base_url", "http://localhost:11434"
+            ),
+            "model": model,
+            "timeout_s": resolve("OLLAMA_TIMEOUT_S", "timeout_s", 180),
+            "chunk_chars": resolve("OLLAMA_CHUNK_CHARS", "chunk_chars", 6000),
+            "num_ctx": resolve("OLLAMA_NUM_CTX", "num_ctx", 8192),
+            "keep_alive": resolve("OLLAMA_KEEP_ALIVE", "keep_alive", "5m"),
+        }
+    )
 
 
 # API Base Configuration
@@ -232,10 +245,11 @@ def classification_result_schema() -> StructType:
 
 
 def llm_result_schema() -> StructType:
-    """Schema for optional full-article Ollama analysis results."""
+    """Schema keyed by article URL and nullable content-version fingerprint."""
     return StructType(
         [
             StructField("url_hash", StringType(), False),
+            StructField("fingerprint", StringType(), True),
             StructField("llm_analysis", StringType(), True),
             StructField("llm_model", StringType(), True),
             StructField("llm_inferred_at", StringType(), True),
@@ -267,7 +281,7 @@ def prepare_base_dataframe(batch_df) -> DataFrame:
     """Prepare base dataframe for inference enrichment.
 
     Selects required fields, adds text_for_inference column, filters nulls,
-    and deduplicates on url_hash.
+    and deduplicates on the (url_hash, fingerprint) article version.
     """
     return (
         batch_df.select(
@@ -343,8 +357,10 @@ def call_classification_api(spark, base_df) -> "DataFrame":
 def call_ollama_analysis(spark, base_df, settings: dict) -> DataFrame:
     """Analyze complete article text independently in each Spark partition."""
     partition_client = call_ollama_analysis_partition
-    client_settings = {key: value for key, value in settings.items() if key != "enabled"}
-    rdd = base_df.select("url_hash", "text_for_llm").rdd.mapPartitions(
+    client_settings = {
+        key: value for key, value in settings.items() if key != "enabled"
+    }
+    rdd = base_df.select("url_hash", "fingerprint", "text_for_llm").rdd.mapPartitions(
         lambda rows: partition_client((row.asDict() for row in rows), **client_settings)
     )
     return spark.createDataFrame(rdd, schema=llm_result_schema())
@@ -492,10 +508,10 @@ def make_foreach_batch_writer(
     """
 
     settings = (
-        dict(ollama_settings) if ollama_settings is not None else load_ollama_settings()
+        validate_ollama_settings(ollama_settings)
+        if ollama_settings is not None
+        else load_ollama_settings()
     )
-    if settings.get("enabled") and not str(settings.get("model") or "").strip():
-        raise ValueError("OLLAMA_MODEL is required when Ollama analysis is enabled")
 
     def foreach_batch_writer(batch_df, batch_id) -> None:
         """Enrich a microbatch with sentiment and classification results and write to all configured sinks.
@@ -505,7 +521,7 @@ def make_foreach_batch_writer(
         2. Prepares base dataframe with text_for_inference
         3. Calls sentiment API via mapPartitions
         4. Calls classification API via mapPartitions
-        5. Joins ONNX and optional full-article Ollama results on url_hash
+        5. Joins ONNX results on url_hash and Ollama on (url_hash, fingerprint)
         6. Writes enriched results to all configured sinks
         7. Displays results to console
         """
@@ -541,10 +557,26 @@ def make_foreach_batch_writer(
             )
             if settings.get("enabled"):
                 llm_df = call_ollama_analysis(spark, base, settings)
-                enriched = enriched.join(llm_df, "url_hash", "left")
+                # A URL may have several content versions within one microbatch.
+                # Null-safe equality also preserves analysis for legacy records.
+                articles = enriched.alias("articles")
+                analysis = llm_df.alias("analysis")
+                enriched = articles.join(
+                    analysis,
+                    (articles["url_hash"] == analysis["url_hash"])
+                    & articles["fingerprint"].eqNullSafe(analysis["fingerprint"]),
+                    "left",
+                ).select(
+                    "articles.*",
+                    *[
+                        analysis[field.name]
+                        for field in llm_result_schema().fields
+                        if field.name not in {"url_hash", "fingerprint"}
+                    ],
+                )
             else:
                 for field in llm_result_schema().fields:
-                    if field.name != "url_hash":
+                    if field.name not in {"url_hash", "fingerprint"}:
                         enriched = enriched.withColumn(
                             field.name, F.lit(None).cast(field.dataType)
                         )
@@ -560,7 +592,9 @@ def make_foreach_batch_writer(
                     F.col("category_error").isNotNull()
                 ).count()
 
-                llm_error_count = enriched.filter(F.col("llm_error").isNotNull()).count()
+                llm_error_count = enriched.filter(
+                    F.col("llm_error").isNotNull()
+                ).count()
                 print(f"[enrich] batch_id={batch_id} llm_errors={llm_error_count}")
 
                 # Write to all configured sinks
@@ -719,9 +753,6 @@ if __name__ == "__main__":
     )
 
     ollama_settings = load_ollama_settings(config)
-    if ollama_settings["enabled"] and not ollama_settings["model"]:
-        raise ValueError("OLLAMA_MODEL is required when Ollama analysis is enabled")
-
     # Wait for inference API to be ready before starting stream
     wait_for_api_ready(
         ready_url=API_HEALTH_ENDPOINT,

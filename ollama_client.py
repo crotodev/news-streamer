@@ -94,6 +94,26 @@ def _validate_analysis(value: Any) -> dict[str, Any]:
     return {field: value[field] for field in sorted(REQUIRED_ANALYSIS_FIELDS)}
 
 
+def _prompt_budget(num_ctx: int) -> int:
+    return num_ctx - min(512, num_ctx // 4) - 128
+
+
+def validate_context_capacity(num_ctx: int) -> None:
+    """Reject contexts that cannot fit fixed instructions, framing, and output."""
+    fixed_prompts = (
+        _ANALYSIS_SYSTEM_PROMPT + "Analyze the complete article text below:\n\n",
+        _CHUNK_SYSTEM_PROMPT + "Article segment 1 of 2:\n\n",
+        _SYNTHESIS_SYSTEM_PROMPT
+        + "Synthesize observations in original article order. "
+        + "All segments are represented below:\n\n",
+    )
+    fixed_bytes = max(len(prompt.encode("utf-8")) for prompt in fixed_prompts)
+    if _prompt_budget(num_ctx) <= fixed_bytes:
+        raise ValueError(
+            "OLLAMA_NUM_CTX is too small for fixed prompts, chat framing, and output reserve"
+        )
+
+
 def _chat(
     session: requests.Session,
     *,
@@ -109,7 +129,7 @@ def _chat(
     # Reserve space for chat framing and generated JSON so Ollama never receives
     # a request we already know cannot fit. Refuse rather than truncate evidence.
     output_tokens = min(512, num_ctx // 4)
-    prompt_budget = num_ctx - output_tokens - 128
+    prompt_budget = _prompt_budget(num_ctx)
     prompt_bytes = len(system_prompt.encode("utf-8")) + len(user_prompt.encode("utf-8"))
     if output_tokens <= 0 or prompt_bytes > prompt_budget:
         raise ValueError("context_budget_exceeded: complete prompt cannot fit num_ctx")
@@ -259,8 +279,9 @@ def call_ollama_analysis_partition(
 ) -> Iterator[Row]:
     """Analyze records independently in bounded groups for a Spark partition.
 
-    Input mappings contain ``url_hash`` and ``text_for_llm``. Each output Row
-    contains the four stable LLM output fields plus ``url_hash``.
+    Input mappings contain ``url_hash``, nullable ``fingerprint``, and
+    ``text_for_llm``. Each output Row preserves both article identity fields
+    alongside the four stable LLM output fields.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
@@ -280,7 +301,12 @@ def call_ollama_analysis_partition(
                 keep_alive=keep_alive,
                 session=http,
             )
-            yield Row(**result)
+            # Keep identity first to match the explicit Spark result schema.
+            yield Row(
+                url_hash=result.pop("url_hash"),
+                fingerprint=item.get("fingerprint"),
+                **result,
+            )
 
     batch: list[dict[str, Any]] = []
     try:
@@ -294,5 +320,3 @@ def call_ollama_analysis_partition(
     finally:
         if own_session:
             http.close()
-
-

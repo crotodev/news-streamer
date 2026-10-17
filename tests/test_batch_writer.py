@@ -5,7 +5,9 @@ import pytest
 import stream
 
 
-def test_writer_raises_when_api_not_ready_and_wait_times_out(spark, monkeypatch) -> None:
+def test_writer_raises_when_api_not_ready_and_wait_times_out(
+    spark, monkeypatch
+) -> None:
     batch_df = spark.createDataFrame([("x",)], "value string")
 
     monkeypatch.setattr(stream, "is_api_ready", lambda *a, **k: False)
@@ -35,6 +37,7 @@ def test_writer_raises_when_processing_fails(spark, monkeypatch) -> None:
 
     with pytest.raises(ValueError):
         writer(batch_df, 0)
+
 
 class _CollectSink:
     def __init__(self):
@@ -90,14 +93,18 @@ def _stub_onnx(spark, monkeypatch):
     )
 
 
-def test_writer_disabled_adds_null_llm_fields_without_calling_ollama(spark, monkeypatch):
+def test_writer_disabled_adds_null_llm_fields_without_calling_ollama(
+    spark, monkeypatch
+):
     monkeypatch.setenv("OLLAMA_ENABLED", "false")
     _stub_onnx(spark, monkeypatch)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("disabled Ollama must not run")
 
-    monkeypatch.setattr(stream, "call_ollama_analysis_partition", forbidden, raising=False)
+    monkeypatch.setattr(
+        stream, "call_ollama_analysis_partition", forbidden, raising=False
+    )
     sink = _CollectSink()
     stream.make_foreach_batch_writer([sink])(_article_batch(spark), 1)
     assert len(sink.rows) == 2
@@ -123,6 +130,7 @@ def test_writer_enabled_passes_full_text_and_settings_and_keeps_failed_articles(
             failed = row["url_hash"] == "h2"
             yield Row(
                 url_hash=row["url_hash"],
+                fingerprint=row["fingerprint"],
                 llm_analysis=(
                     None
                     if failed
@@ -174,3 +182,102 @@ def test_writer_rejects_enabled_ollama_without_model():
         stream.make_foreach_batch_writer(
             [], ollama_settings={"enabled": True, "model": "  "}
         )
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [("timeout_s", 0), ("chunk_chars", -1), ("num_ctx", 256), ("num_ctx", "bad")],
+)
+def test_writer_rejects_invalid_enabled_settings_before_api_readiness(
+    monkeypatch, key, value
+):
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid Ollama configuration reached API readiness")
+
+    monkeypatch.setattr(stream, "is_api_ready", forbidden)
+    with pytest.raises(ValueError, match="OLLAMA_" + key.upper()):
+        stream.make_foreach_batch_writer(
+            [], {"enabled": True, "model": "local", key: value}
+        )
+
+
+@pytest.mark.parametrize("key", ["timeout_s", "chunk_chars", "num_ctx"])
+@pytest.mark.parametrize("value", ["invalid", "0", "-2"])
+def test_startup_rejects_invalid_enabled_settings_before_api_wait(
+    monkeypatch, tmp_path, key, value
+):
+    import runpy
+    import sys
+    import checks
+
+    config = tmp_path / "config.yaml"
+    config.write_text(f"ollama:\n  enabled: true\n  model: local\n  {key}: {value}\n")
+    monkeypatch.setattr(sys, "argv", ["stream.py", "--config", str(config)])
+    monkeypatch.setattr(checks, "check_java_version", lambda: None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid Ollama configuration reached API readiness HTTP")
+
+    monkeypatch.setattr(stream.requests, "get", forbidden)
+    with pytest.raises(ValueError, match="OLLAMA_" + key.upper()):
+        runpy.run_path(stream.__file__, run_name="__main__")
+
+
+def test_writer_matches_ollama_to_article_versions_including_null_fingerprint(
+    spark, monkeypatch
+):
+    import json
+    from pyspark.sql import Row
+
+    _stub_onnx(spark, monkeypatch)
+    records = [
+        {
+            "url_hash": "h1",
+            "url": "https://example.com/same",
+            "fingerprint": "v1",
+            "text": "original body",
+            "summary": "brief",
+        },
+        {
+            "url_hash": "h1",
+            "url": "https://example.com/same",
+            "fingerprint": "v2",
+            "text": "updated body",
+            "summary": "brief",
+        },
+        {
+            "url_hash": "h1",
+            "url": "https://example.com/same",
+            "fingerprint": None,
+            "text": "legacy body",
+            "summary": "brief",
+        },
+    ]
+    batch = stream.parse_raw_news(
+        spark.createDataFrame(
+            [(json.dumps(record),) for record in records], "value string"
+        )
+    )
+
+    def analyze_partition(rows, **settings):
+        for row in reversed(list(rows)):
+            result = {"url_hash": row["url_hash"], "fingerprint": row["fingerprint"]}
+            result.update(
+                llm_analysis=row["text_for_llm"],
+                llm_model="local",
+                llm_inferred_at="now",
+                llm_error=None,
+            )
+            yield Row(**result)
+
+    monkeypatch.setattr(stream, "call_ollama_analysis_partition", analyze_partition)
+    sink = _CollectSink()
+    stream.make_foreach_batch_writer([sink], {"enabled": True, "model": "local"})(
+        batch, 3
+    )
+    assert len(sink.rows) == 3
+    assert {row.fingerprint: row.llm_analysis for row in sink.rows} == {
+        "v1": "original body",
+        "v2": "updated body",
+        None: "legacy body",
+    }

@@ -109,12 +109,12 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) python stream.py \
 
 ```bash
 JAVA_HOME=$(/usr/libexec/java_home -v 17) python stream.py --starting-offsets earliest
+```
 
 ### Enable Kafka Output
 
 ```bash
 JAVA_HOME=$(/usr/libexec/java_home -v 17) python stream.py --write-kafka
-```
 ```
 
 ## Optional full-article analysis with Ollama

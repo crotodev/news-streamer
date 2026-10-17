@@ -139,6 +139,7 @@ python stream.py
 ```
 
 For the root Docker Compose deployment, the same environment variables are passed into the streamer, with a container default URL of `http://host.docker.internal:11434`. See the root README for the Compose command. Docker Desktop provides that hostname on Windows/macOS; other Docker environments need a host address reachable from the container or an appropriate host gateway mapping. A remote Ollama server can be selected with `OLLAMA_BASE_URL`.
+Ollama binds to `127.0.0.1:11434` by default. A container or remote client may not be able to reach that loopback address. Set `OLLAMA_HOST` to `0.0.0.0:11434` (or another suitable network interface) and restart Ollama to expose it on the network. See the [Ollama network exposure FAQ](https://docs.ollama.com/faq#how-can-i-expose-ollama-on-my-network).
 
 YAML values belong under `ollama` in `config.yaml`. Each corresponding environment variable takes precedence. Ollama has no command-line flags in the streamer.
 

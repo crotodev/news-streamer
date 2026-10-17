@@ -77,7 +77,18 @@ def test_text_for_inference_is_truncated(spark) -> None:
     assert len(row.text_for_inference) == stream.MAX_INFER_CHARS
 
 
-def test_default_ollama_settings_are_disabled() -> None:
+def test_default_ollama_settings_are_disabled(monkeypatch) -> None:
+    for name in (
+        "OLLAMA_ENABLED",
+        "OLLAMA_BASE_URL",
+        "OLLAMA_MODEL",
+        "OLLAMA_TIMEOUT_S",
+        "OLLAMA_CHUNK_CHARS",
+        "OLLAMA_NUM_CTX",
+        "OLLAMA_KEEP_ALIVE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
     settings = stream.load_ollama_settings({})
 
     assert settings["enabled"] is False
@@ -90,6 +101,17 @@ def test_default_ollama_settings_are_disabled() -> None:
 
 
 def test_ollama_settings_use_yaml_defaults_and_environment_overrides(monkeypatch) -> None:
+    for name in (
+        "OLLAMA_ENABLED",
+        "OLLAMA_BASE_URL",
+        "OLLAMA_MODEL",
+        "OLLAMA_TIMEOUT_S",
+        "OLLAMA_CHUNK_CHARS",
+        "OLLAMA_NUM_CTX",
+        "OLLAMA_KEEP_ALIVE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
     monkeypatch.setenv("OLLAMA_ENABLED", "true")
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama:11434")
     monkeypatch.setenv("OLLAMA_MODEL", "test-model")

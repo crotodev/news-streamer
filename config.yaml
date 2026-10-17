@@ -9,3 +9,12 @@ kafka:
 spark:
   checkpoint_location: "/tmp/raw_news_checkpoints"
   app_name: "raw-news-stream"
+
+ollama:
+  enabled: false
+  base_url: "http://localhost:11434"
+  model: null
+  timeout_s: 180
+  chunk_chars: 6000
+  num_ctx: 8192
+  keep_alive: "5m"

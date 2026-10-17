@@ -44,6 +44,44 @@ def _coerce_bool(value, default: bool) -> bool:
     return default
 
 
+def _env_int_or_config(name: str, config_value, default: int) -> int:
+    """Resolve an integer setting with environment values taking precedence."""
+    value = os.environ.get(name)
+    if value is None:
+        value = config_value
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def load_ollama_settings(config: Optional[dict] = None) -> dict:
+    """Resolve Ollama settings from YAML values and environment overrides."""
+    configured = (config or {}).get("ollama", {}) or {}
+
+    def resolve(name: str, key: str, default):
+        return os.environ.get(name, configured.get(key, default))
+
+    model = resolve("OLLAMA_MODEL", "model", None)
+    if model is not None and not str(model).strip():
+        model = None
+    return {
+        "enabled": _coerce_bool(resolve("OLLAMA_ENABLED", "enabled", False), False),
+        "base_url": resolve("OLLAMA_BASE_URL", "base_url", "http://localhost:11434"),
+        "model": model,
+        "timeout_s": _env_int_or_config(
+            "OLLAMA_TIMEOUT_S", configured.get("timeout_s"), 180
+        ),
+        "chunk_chars": _env_int_or_config(
+            "OLLAMA_CHUNK_CHARS", configured.get("chunk_chars"), 6000
+        ),
+        "num_ctx": _env_int_or_config(
+            "OLLAMA_NUM_CTX", configured.get("num_ctx"), 8192
+        ),
+        "keep_alive": resolve("OLLAMA_KEEP_ALIVE", "keep_alive", "5m"),
+    }
+
+
 # API Base Configuration
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:9000")
 SENTIMENT_ENDPOINT = os.environ.get(
@@ -192,6 +230,19 @@ def classification_result_schema() -> StructType:
     )
 
 
+def llm_result_schema() -> StructType:
+    """Schema for optional full-article Ollama analysis results."""
+    return StructType(
+        [
+            StructField("url_hash", StringType(), False),
+            StructField("llm_analysis", StringType(), True),
+            StructField("llm_model", StringType(), True),
+            StructField("llm_inferred_at", StringType(), True),
+            StructField("llm_error", StringType(), True),
+        ]
+    )
+
+
 def _non_blank(col_name: str) -> F.Column:
     """Return the column value, or null if it is null/blank."""
     column = F.col(col_name)
@@ -232,6 +283,13 @@ def prepare_base_dataframe(batch_df) -> DataFrame:
             "fingerprint",
         )
         .withColumn("text_for_inference", build_text_for_inference())
+        .withColumn(
+            "text_for_llm",
+            F.when(
+                F.trim(F.regexp_replace(F.col("text"), r"\s+", " ")) != "",
+                F.trim(F.regexp_replace(F.col("text"), r"\s+", " ")),
+            ),
+        )
         .filter(F.col("url_hash").isNotNull() & F.col("text_for_inference").isNotNull())
         .dropDuplicates(["url_hash", "fingerprint"])
     )

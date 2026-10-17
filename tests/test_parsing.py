@@ -75,3 +75,85 @@ def test_text_for_inference_is_truncated(spark) -> None:
     [row] = stream.prepare_base_dataframe(parsed).collect()
 
     assert len(row.text_for_inference) == stream.MAX_INFER_CHARS
+
+
+def test_default_ollama_settings_are_disabled() -> None:
+    settings = stream.load_ollama_settings({})
+
+    assert settings["enabled"] is False
+    assert settings["base_url"] == "http://localhost:11434"
+    assert settings["model"] is None
+    assert settings["timeout_s"] == 180
+    assert settings["chunk_chars"] == 6000
+    assert settings["num_ctx"] == 8192
+    assert settings["keep_alive"] == "5m"
+
+
+def test_ollama_settings_use_yaml_defaults_and_environment_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("OLLAMA_ENABLED", "true")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    monkeypatch.setenv("OLLAMA_MODEL", "test-model")
+
+    settings = stream.load_ollama_settings(
+        {
+            "ollama": {
+                "enabled": False,
+                "base_url": "http://yaml:11434",
+                "model": "yaml-model",
+                "timeout_s": 90,
+                "chunk_chars": 3000,
+                "num_ctx": 4096,
+                "keep_alive": "1m",
+            }
+        }
+    )
+
+    assert settings == {
+        "enabled": True,
+        "base_url": "http://ollama:11434",
+        "model": "test-model",
+        "timeout_s": 90,
+        "chunk_chars": 3000,
+        "num_ctx": 4096,
+        "keep_alive": "1m",
+    }
+
+
+def test_text_for_llm_uses_full_whitespace_normalized_body(spark, monkeypatch) -> None:
+    monkeypatch.setattr(stream, "MAX_INFER_CHARS", 12)
+    parsed = stream.parse_raw_news(
+        _kafka_df(spark, _item(text="  " + "long   body\n" * 100, summary="summary"))
+    )
+    [row] = stream.prepare_base_dataframe(parsed).collect()
+
+    assert row.text_for_inference == "summary"
+    assert row.text_for_llm == " ".join(("long body" for _ in range(100)))
+    assert len(row.text_for_llm) > stream.MAX_INFER_CHARS
+
+
+def test_missing_or_blank_body_keeps_onnx_fallback_and_null_llm_text(spark) -> None:
+    parsed = stream.parse_raw_news(
+        _kafka_df(
+            spark,
+            _item(text=None, summary="brief"),
+            _item(url_hash="h2", fingerprint="f2", text=" \n  ", summary="brief"),
+        )
+    )
+    rows = {row.url_hash: row for row in stream.prepare_base_dataframe(parsed).collect()}
+
+    assert rows["h1"].text_for_inference == "brief"
+    assert rows["h1"].text_for_llm is None
+    assert rows["h2"].text_for_inference == "brief"
+    assert rows["h2"].text_for_llm is None
+
+
+def test_llm_result_schema_has_nullable_result_fields() -> None:
+    fields = {field.name: field.nullable for field in stream.llm_result_schema().fields}
+
+    assert fields == {
+        "url_hash": False,
+        "llm_analysis": True,
+        "llm_model": True,
+        "llm_inferred_at": True,
+        "llm_error": True,
+    }

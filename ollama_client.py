@@ -60,15 +60,7 @@ def chunk_text(text: str, chunk_chars: int) -> list[str]:
     current_length = 0
     for word in normalized.split(" "):
         if len(word) > chunk_chars:
-            if current:
-                chunks.append(" ".join(current))
-                current = []
-                current_length = 0
-            chunks.extend(
-                word[offset : offset + chunk_chars]
-                for offset in range(0, len(word), chunk_chars)
-            )
-            continue
+            raise ValueError("article_token_exceeds_chunk_budget")
         added_length = len(word) + (1 if current else 0)
         if current and current_length + added_length > chunk_chars:
             chunks.append(" ".join(current))
@@ -113,6 +105,14 @@ def _chat(
     num_ctx: int,
     keep_alive: str,
 ) -> dict[str, Any]:
+    # UTF-8 bytes are a conservative token bound for byte-fallback tokenizers.
+    # Reserve space for chat framing and generated JSON so Ollama never receives
+    # a request we already know cannot fit. Refuse rather than truncate evidence.
+    output_tokens = min(512, num_ctx // 4)
+    prompt_budget = num_ctx - output_tokens - 128
+    prompt_bytes = len(system_prompt.encode("utf-8")) + len(user_prompt.encode("utf-8"))
+    if output_tokens <= 0 or prompt_bytes > prompt_budget:
+        raise ValueError("context_budget_exceeded: complete prompt cannot fit num_ctx")
     response = session.post(
         f"{base_url.rstrip('/')}/api/chat",
         json={
@@ -123,7 +123,11 @@ def _chat(
             ],
             "format": "json",
             "stream": False,
-            "options": {"temperature": 0, "num_ctx": num_ctx},
+            "options": {
+                "temperature": 0,
+                "num_ctx": num_ctx,
+                "num_predict": output_tokens,
+            },
             "keep_alive": keep_alive,
         },
         timeout=timeout_s,
@@ -181,11 +185,11 @@ def analyze_article(
             url_hash, model, inferred_at, "chunk_chars must be greater than zero"
         )
     normalized = " ".join(text.split())
-    chunks = chunk_text(normalized, chunk_chars)
     own_session = session is None
     http = session or requests.Session()
 
     try:
+        chunks = chunk_text(normalized, chunk_chars)
         if len(chunks) == 1:
             result = _chat(
                 http,

@@ -78,6 +78,7 @@ def test_short_article_uses_one_json_chat_request_and_returns_valid_result():
     assert kwargs["json"]["format"] == "json"
     assert kwargs["json"]["options"]["temperature"] == 0
     assert kwargs["json"]["options"]["num_ctx"] == 4096
+    assert kwargs["json"]["options"]["num_predict"] == 512
     assert kwargs["json"]["keep_alive"] == "2m"
     assert "Full article body" in kwargs["json"]["messages"][-1]["content"]
     assert result["url_hash"] == "hash-1"
@@ -220,8 +221,49 @@ def test_partition_adapter_keeps_each_url_hash_and_isolates_articles():
 
 
 
-def test_chunking_bounds_an_unusually_long_token_without_dropping_characters():
-    token = "x" * 25
-    chunks = chunk_text(token, 8)
-    assert all(len(chunk) <= 8 for chunk in chunks)
-    assert "".join(chunks) == token
+def test_chunking_rejects_an_oversized_token_without_splitting_it():
+    with pytest.raises(ValueError, match="article_token_exceeds_chunk_budget"):
+        chunk_text("prefix " + "x" * 25 + " suffix", 8)
+
+
+def test_oversized_article_token_returns_an_explicit_error_before_http():
+    session = FakeSession([FakeResponse(analysis())] * 10)
+    result = analyze_article(
+        "hash-token", "prefix " + "x" * 25 + " suffix",
+        base_url="http://localhost:11434", model="local", timeout_s=10,
+        chunk_chars=8, num_ctx=4096, keep_alive="5m", session=session,
+    )
+    assert result["llm_analysis"] is None
+    assert "article_token_exceeds_chunk_budget" in result["llm_error"]
+    assert session.calls == []
+
+
+def test_oversized_synthesis_returns_error_without_sending_an_over_budget_prompt():
+    text = "alpha beta gamma delta"
+    chunks = chunk_text(text, 10)
+    session = FakeSession(
+        [FakeResponse(analysis("observation " * 600)) for _ in chunks]
+        + [FakeResponse(analysis("must not be used"))]
+    )
+    result = analyze_article(
+        "hash-synthesis", text,
+        base_url="http://localhost:11434", model="local", timeout_s=10,
+        chunk_chars=10, num_ctx=4096, keep_alive="5m", session=session,
+    )
+    assert len(session.calls) == len(chunks)
+    sent = [call[1]["json"]["messages"][-1]["content"] for call in session.calls]
+    assert all(chunk in " ".join(sent) for chunk in chunks)
+    assert result["llm_analysis"] is None
+    assert "context_budget_exceeded" in result["llm_error"]
+
+
+def test_article_prompt_budget_counts_unicode_bytes_before_http():
+    session = FakeSession([FakeResponse(analysis())])
+    result = analyze_article(
+        "hash-unicode", "\u754c" * 1000,
+        base_url="http://localhost:11434", model="local", timeout_s=10,
+        chunk_chars=2000, num_ctx=2048, keep_alive="5m", session=session,
+    )
+    assert session.calls == []
+    assert result["llm_analysis"] is None
+    assert "context_budget_exceeded" in result["llm_error"]
